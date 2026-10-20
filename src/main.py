@@ -3,8 +3,9 @@
 Example:
     python src/main.py --cam 0 --zone counter
 
-Press Z to draw or replace the selected zone, and press Q to quit. Named
-zones are stored in data/zones.json so they can be reused later.
+Press Z to draw or replace the hand zone, S to draw or replace the stove
+zone, and Q to quit. Named zones are stored in data/zones.json so they can
+be reused later.
 """
 
 import argparse
@@ -28,6 +29,10 @@ MODEL_URL = (
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
 DEBOUNCE_SEC = 1.0
+
+# The stove always has this fixed name so later steps can find it in zones.json.
+STOVE_ZONE = "stove"
+ORANGE = (0, 165, 255)  # OpenCV colors are BGR, not RGB.
 
 # An OpenCV rectangle contains x, y, width, and height.
 Zone = tuple[int, int, int, int]
@@ -167,6 +172,19 @@ def count_hands_in_zone(
     return count
 
 
+def select_zone(frame: object) -> Zone | None:
+    """Let the user drag a rectangle on the frame; None if they cancel."""
+    import cv2
+
+    x, y, width, height = (
+        int(value) for value in cv2.selectROI("Nudge", frame, showCrosshair=False)
+    )
+    # selectROI returns a zero-sized rectangle when the user presses Esc or C.
+    if width <= 0 or height <= 0:
+        return None
+    return x, y, width, height
+
+
 def describe_duration(seconds: float) -> str:
     """Format elapsed seconds as a short, human-readable duration."""
     whole_seconds = int(seconds)
@@ -196,6 +214,10 @@ def main() -> None:
     if args.list_zones:
         print_saved_zones(zones)
         return
+
+    if args.zone == STOVE_ZONE:
+        # The stove is drawn with S and watched for objects, not hands.
+        raise SystemExit(f'"{STOVE_ZONE}" is reserved for the stove; pick another --zone')
 
     # Load the large camera libraries only when tracking is about to start.
     # Commands such as --list-zones can then run without camera dependencies.
@@ -329,6 +351,37 @@ def main() -> None:
                     2,
                 )
 
+            # Draw the stove in orange so it is easy to tell apart from the hand zone.
+            stove_zone = zones.get(STOVE_ZONE)
+            if stove_zone is not None:
+                x, y, zone_width, zone_height = stove_zone
+                cv2.rectangle(
+                    frame,
+                    (x, y),
+                    (x + zone_width, y + zone_height),
+                    ORANGE,
+                    2,
+                )
+                cv2.putText(
+                    frame,
+                    "STOVE",
+                    (x, max(y - 8, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    ORANGE,
+                    2,
+                )
+            else:
+                cv2.putText(
+                    frame,
+                    "Press S to draw the stove",
+                    (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    ORANGE,
+                    2,
+                )
+
             # Show the six most recent events at the bottom of the camera view.
             for index, line in enumerate(recent_events):
                 y_position = frame_height - 20 - 25 * (
@@ -351,13 +404,9 @@ def main() -> None:
                 break
 
             if key == ord("z"):
-                selected_rectangle = cv2.selectROI(
-                    "Nudge",
-                    frame,
-                    showCrosshair=False,
-                )
-                if selected_rectangle[2] > 0 and selected_rectangle[3] > 0:
-                    zone = tuple(int(value) for value in selected_rectangle)
+                selected_zone = select_zone(frame)
+                if selected_zone is not None:
+                    zone = selected_zone
                     zones[zone_name] = zone
                     save_zones(zones)
                     log_event(
@@ -365,6 +414,13 @@ def main() -> None:
                         f'Zone "{zone_name}" was saved',
                         recent_events,
                     )
+
+            if key == ord("s"):
+                selected_zone = select_zone(frame)
+                if selected_zone is not None:
+                    zones[STOVE_ZONE] = selected_zone
+                    save_zones(zones)
+                    log_event("stove_zone_set", "Stove zone set", recent_events)
     finally:
         # Always release native camera and MediaPipe resources, even after errors.
         log_event(

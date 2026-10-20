@@ -12,10 +12,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Camera-specific runtime configuration
-data/zones.json
-data/zones.json.tmp
+# Personal runtime data: zones, event log, stove reference, snapshots
+data/
 
-
-# Runtime event log written by the app
-data/events.jsonl
+# Secrets
+.env
