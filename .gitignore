@@ -16,3 +16,6 @@ __pycache__/
 data/zones.json
 data/zones.json.tmp
 
+
+# Runtime event log written by the app
+data/events.jsonl
