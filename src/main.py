@@ -223,11 +223,11 @@ def main() -> None:
     # Debouncing prevents a brief missed detection from creating false events.
     confirmed_inside = False
     candidate_inside = False
-    candidate_since = time.time()
+    candidate_since = time.monotonic()
     arrived_at: float | None = None
     hands_seen = 0
     recent_events: list[str] = []
-    started_at = time.time()
+    started_at = time.monotonic()
 
     log_event(
         "nudge_started",
@@ -246,7 +246,7 @@ def main() -> None:
             # Convert the camera frame into the image format MediaPipe expects.
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             media_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            timestamp_ms = int((time.time() - started_at) * 1000)
+            timestamp_ms = int((time.monotonic() - started_at) * 1000)
             result = landmarker.detect_for_video(media_image, timestamp_ms)
 
             # Draw detected landmarks so the user can see what the model found.
@@ -269,13 +269,13 @@ def main() -> None:
             # Confirm a state change only after it lasts for DEBOUNCE_SEC.
             if currently_inside != candidate_inside:
                 candidate_inside = currently_inside
-                candidate_since = time.time()
+                candidate_since = time.monotonic()
                 hands_seen = detected_hands
             else:
                 hands_seen = max(hands_seen, detected_hands)
                 if (
                     candidate_inside != confirmed_inside
-                    and time.time() - candidate_since >= DEBOUNCE_SEC
+                    and time.monotonic() - candidate_since >= DEBOUNCE_SEC
                 ):
                     confirmed_inside = candidate_inside
                     if confirmed_inside:
