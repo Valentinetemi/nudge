@@ -4,7 +4,8 @@ Example:
     python src/main.py --cam 0 --zone counter
 
 Press Z to draw or replace the hand zone, S to draw or replace the stove
-zone, and Q to quit. Named zones are stored in data/zones.json so they can
+zone, B to photograph the empty stove (the reference used to notice items
+placed on it), and Q to quit. Named zones are stored in data/zones.json so they can
 be reused later.
 """
 
@@ -23,6 +24,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 MODEL_PATH = PROJECT_ROOT / "models" / "hand_landmarker.task"
 ZONES_FILE = DATA_DIR / "zones.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
+STOVE_REFERENCE_FILE = DATA_DIR / "stove_reference.png"
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -226,6 +228,8 @@ def main() -> None:
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision
 
+    import stove
+
     zone_name = args.zone
     zone = zones.get(zone_name)
     ensure_model()
@@ -251,6 +255,12 @@ def main() -> None:
     recent_events: list[str] = []
     started_at = time.monotonic()
 
+    # The empty-stove picture that every frame is compared against.
+    stove_reference = stove.load_reference(
+        STOVE_REFERENCE_FILE, zones.get(STOVE_ZONE)
+    )
+    stove_occupied = stove.Debounced(DEBOUNCE_SEC)
+
     log_event(
         "nudge_started",
         f'Nudge started watching zone "{zone_name}"',
@@ -264,6 +274,36 @@ def main() -> None:
                 break
 
             frame_height, frame_width = frame.shape[:2]
+
+            # Measure the stove before anything is drawn on the frame, so the
+            # overlays themselves never count as "something on the stove".
+            stove_zone = zones.get(STOVE_ZONE)
+            stove_patch = (
+                stove.prepare_patch(frame, stove_zone) if stove_zone is not None else None
+            )
+            stove_change: float | None = None
+            # Shapes differ if the camera resolution changed since the
+            # reference was taken; comparing then would be meaningless.
+            if (
+                stove_patch is not None
+                and stove_reference is not None
+                and stove_patch.shape == stove_reference.shape
+            ):
+                stove_change = stove.change_percent(stove_reference, stove_patch)
+                raw_occupied = stove_change >= stove.OCCUPIED_PERCENT
+                if stove_occupied.update(raw_occupied, time.monotonic()):
+                    if stove_occupied.value:
+                        log_event(
+                            "stove_item_placed",
+                            "Something was placed on the stove",
+                            recent_events,
+                        )
+                    else:
+                        log_event(
+                            "stove_clear",
+                            "The stove is clear again",
+                            recent_events,
+                        )
 
             # Convert the camera frame into the image format MediaPipe expects.
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -351,10 +391,16 @@ def main() -> None:
                     2,
                 )
 
-            # Draw the stove in orange so it is easy to tell apart from the hand zone.
-            stove_zone = zones.get(STOVE_ZONE)
+            # Draw the stove in orange so it is easy to tell apart from the hand
+            # zone. The live change percentage is shown to help tune
+            # stove.OCCUPIED_PERCENT.
             if stove_zone is not None:
                 x, y, zone_width, zone_height = stove_zone
+                if stove_change is None:
+                    stove_label = "STOVE - press B while empty"
+                else:
+                    state = "occupied" if stove_occupied.value else "clear"
+                    stove_label = f"STOVE {stove_change:.1f}% ({state})"
                 cv2.rectangle(
                     frame,
                     (x, y),
@@ -364,7 +410,7 @@ def main() -> None:
                 )
                 cv2.putText(
                     frame,
-                    "STOVE",
+                    stove_label,
                     (x, max(y - 8, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -420,7 +466,26 @@ def main() -> None:
                 if selected_zone is not None:
                     zones[STOVE_ZONE] = selected_zone
                     save_zones(zones)
+                    # The old empty-stove picture no longer lines up with the
+                    # new box, so a fresh one must be taken with B.
+                    stove_reference = None
+                    stove_occupied = stove.Debounced(DEBOUNCE_SEC)
                     log_event("stove_zone_set", "Stove zone set", recent_events)
+
+            if key == ord("b"):
+                if stove_patch is None:
+                    print("Draw the stove zone with S before pressing B.")
+                else:
+                    # stove_patch was taken from this frame before any drawing.
+                    stove_reference = stove_patch
+                    stove.save_reference(STOVE_REFERENCE_FILE, stove_reference)
+                    # The stove is empty by definition when the picture is taken.
+                    stove_occupied = stove.Debounced(DEBOUNCE_SEC)
+                    log_event(
+                        "stove_reference_saved",
+                        "Saved a picture of the empty stove",
+                        recent_events,
+                    )
     finally:
         # Always release native camera and MediaPipe resources, even after errors.
         log_event(
