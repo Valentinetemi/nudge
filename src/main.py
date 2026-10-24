@@ -257,11 +257,14 @@ def main() -> None:
     recent_events: list[str] = []
     started_at = time.monotonic()
 
-    # The empty-stove picture that every frame is compared against.
+    # The empty-stove picture that every frame is compared against. While
+    # the stove stays clear it drifts slowly, so daylight does not pile up
+    # into a false "something was placed" event.
     stove_reference = stove.load_reference(
         STOVE_REFERENCE_FILE, zones.get(STOVE_ZONE)
     )
     stove_occupied = stove.Debounced(DEBOUNCE_SEC)
+    last_reference_adapt = time.monotonic()
 
     log_event(
         "nudge_started",
@@ -293,7 +296,17 @@ def main() -> None:
             ):
                 stove_change = stove.change_percent(stove_reference, stove_patch)
                 raw_occupied = stove_change >= stove.OCCUPIED_PERCENT
-                if stove_occupied.update(raw_occupied, time.monotonic()):
+                now = time.monotonic()
+                # Learn only from frames that look empty. Adapting while a
+                # pot is in view would teach the picture to ignore the pot.
+                if stove.should_adapt_reference(raw_occupied, stove_occupied.value):
+                    stove_reference = stove.adapt_reference(
+                        stove_reference,
+                        stove_patch,
+                        now - last_reference_adapt,
+                    )
+                last_reference_adapt = now
+                if stove_occupied.update(raw_occupied, now):
                     if stove_occupied.value:
                         log_event(
                             "stove_item_placed",
@@ -472,6 +485,7 @@ def main() -> None:
                     # new box, so a fresh one must be taken with B.
                     stove_reference = None
                     stove_occupied = stove.Debounced(DEBOUNCE_SEC)
+                    last_reference_adapt = time.monotonic()
                     log_event("stove_zone_set", "Stove zone set", recent_events)
 
             if key == ord("b"):
@@ -479,10 +493,11 @@ def main() -> None:
                     print("Draw the stove zone with S before pressing B.")
                 else:
                     # stove_patch was taken from this frame before any drawing.
-                    stove_reference = stove_patch
+                    stove_reference = stove.working_copy(stove_patch)
                     stove.save_reference(STOVE_REFERENCE_FILE, stove_reference)
                     # The stove is empty by definition when the picture is taken.
                     stove_occupied = stove.Debounced(DEBOUNCE_SEC)
+                    last_reference_adapt = time.monotonic()
                     log_event(
                         "stove_reference_saved",
                         "Saved a picture of the empty stove",
