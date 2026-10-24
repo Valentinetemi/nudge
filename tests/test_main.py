@@ -1,5 +1,7 @@
 """Checks for command-line defaults that do not need a camera."""
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -24,7 +26,10 @@ class NudgeArgumentTest(unittest.TestCase):
 
     def test_a_zero_wait_is_rejected(self) -> None:
         sys.argv = ["main.py", "--nudge-after", "0"]
-        with self.assertRaises(SystemExit):
+        with (
+            self.assertRaises(SystemExit),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             main.parse_arguments()
 
 
