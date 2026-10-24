@@ -1,12 +1,17 @@
-"""Track hands inside a named camera zone and record activity events.
+"""Watch a stove and gently remind someone if they walk away.
 
 Example:
-    python src/main.py --cam 0 --zone counter
+    python src/main.py
+    python src/main.py --nudge-after 15
 
 Press Z to draw or replace the hand zone, S to draw or replace the stove
 zone, B to photograph the empty stove (the reference used to notice items
-placed on it), and Q to quit. Named zones are stored in data/zones.json so they can
-be reused later.
+placed on it), and Q to quit. Named zones are stored in data/zones.json so
+they can be reused later.
+
+A reminder is spoken when the stove still looks occupied and no hands have
+been in the hand zone or on the stove for a few minutes. It repeats a little
+more directly until the person comes back or the stove is clear.
 """
 
 import argparse
@@ -16,6 +21,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import nudge
 
 # Resolve files from the repository root instead of the terminal's current
 # directory. This lets the program work when launched from somewhere else.
@@ -50,10 +56,21 @@ def parse_zone_name(value: str) -> str:
     return name
 
 
+def parse_positive_seconds(value: str) -> float:
+    """Parse a number of seconds that must be greater than zero."""
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("time must be a number of seconds") from error
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("time must be greater than zero")
+    return seconds
+
+
 def parse_arguments() -> argparse.Namespace:
-    """Read camera and zone choices from command-line arguments."""
+    """Read camera, zone, and reminder timing from command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Track hands inside a named area of the camera frame."
+        description="Watch a stove and gently remind someone who walks away."
     )
     parser.add_argument(
         "--cam",
@@ -66,6 +83,21 @@ def parse_arguments() -> argparse.Namespace:
         type=parse_zone_name,
         default="counter",
         help="zone to load or create (default: counter)",
+    )
+    parser.add_argument(
+        "--nudge-after",
+        type=parse_positive_seconds,
+        default=nudge.DEFAULT_WAIT_SECONDS,
+        help=(
+            "seconds with nobody nearby before the first reminder "
+            "(default: 180). Use 15 for a short demo."
+        ),
+    )
+    parser.add_argument(
+        "--nudge-repeat",
+        type=parse_positive_seconds,
+        default=nudge.DEFAULT_REPEAT_SECONDS,
+        help="seconds between later reminders if nobody returns (default: 60)",
     )
     parser.add_argument(
         "--list-zones",
@@ -189,11 +221,44 @@ def select_zone(frame: object) -> Zone | None:
 
 def describe_duration(seconds: float) -> str:
     """Format elapsed seconds as a short, human-readable duration."""
-    whole_seconds = int(seconds)
+    whole_seconds = max(0, int(seconds))
     if whole_seconds < 60:
         return f"{whole_seconds} seconds"
     minutes, remaining_seconds = divmod(whole_seconds, 60)
+    if remaining_seconds == 0:
+        return f"{minutes} min"
     return f"{minutes} min {remaining_seconds} sec"
+
+
+def draw_reminder(frame: object, message: str) -> None:
+    """Paint the current reminder in a warm bar across the top of the picture.
+
+    The bar is clay colored, not red. This is a tap on the shoulder, not an alarm.
+    """
+    import cv2
+
+    _height, width = frame.shape[:2]
+    cv2.rectangle(frame, (0, 0), (width, 56), (45, 85, 130), -1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thickness = 2
+    # Shrink the sentence until it fits a narrow camera picture.
+    while scale > 0.45:
+        (text_width, _text_height), _baseline = cv2.getTextSize(
+            message, font, scale, thickness
+        )
+        if text_width <= width - 32:
+            break
+        scale -= 0.05
+    cv2.putText(
+        frame,
+        message,
+        (16, 36),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+    )
 
 
 def print_saved_zones(zones: dict[str, Zone]) -> None:
@@ -228,6 +293,7 @@ def main() -> None:
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision
 
+    import speak
     import stove
 
     zone_name = args.zone
@@ -265,10 +331,19 @@ def main() -> None:
     )
     stove_occupied = stove.Debounced(DEBOUNCE_SEC)
     last_reference_adapt = time.monotonic()
+    # Hands count as nearby in the named zone or over the stove. The same
+    # one-second debounce as the event log, so a missed frame does not
+    # restart the reminder clock.
+    hands_nearby = stove.Debounced(DEBOUNCE_SEC)
+    reminders = nudge.NudgeRule(args.nudge_after, args.nudge_repeat)
+    speaker = speak.Speaker()
 
     log_event(
         "nudge_started",
-        f'Nudge started watching zone "{zone_name}"',
+        (
+            f'Nudge started watching zone "{zone_name}" '
+            f"(reminder after {describe_duration(args.nudge_after)} unattended)"
+        ),
         recent_events,
     )
 
@@ -375,6 +450,35 @@ def main() -> None:
                             recent_events,
                         )
 
+            hands_over_stove = count_hands_in_zone(
+                result,
+                stove_zone,
+                frame_width,
+                frame_height,
+            )
+            now = time.monotonic()
+            hands_nearby.update(currently_inside or hands_over_stove > 0, now)
+            # Confirmed readings only. A single noisy frame must not nudge,
+            # and must not cancel a nudge either.
+            step = reminders.update(
+                stove_occupied=stove_occupied.value,
+                hands_nearby=hands_nearby.value,
+                now=now,
+            )
+            if step.nudge is not None:
+                log_event("nudge", step.nudge.message, recent_events)
+                speaker.say(step.nudge.message)
+            elif step.ended is not None:
+                log_event(
+                    "nudge_ended",
+                    nudge.ended_message(step.ended),
+                    recent_events,
+                )
+
+            # A reminder banner covers the top of the picture, so other labels
+            # start lower while one is showing.
+            top = 78 if reminders.reminder else 0
+
             # Draw the active zone, or explain how to create it when missing.
             if zone is not None:
                 x, y, zone_width, zone_height = zone
@@ -389,7 +493,7 @@ def main() -> None:
                 cv2.putText(
                     frame,
                     zone_name.upper(),
-                    (x, max(y - 8, 20)),
+                    (x, max(y - 8, 20 + top)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     color,
@@ -399,7 +503,7 @@ def main() -> None:
                 cv2.putText(
                     frame,
                     f'Press Z to draw zone "{zone_name}"',
-                    (20, 40),
+                    (20, 40 + top),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
                     (0, 255, 255),
@@ -415,6 +519,11 @@ def main() -> None:
                     stove_label = "STOVE - press B while empty"
                 else:
                     state = "occupied" if stove_occupied.value else "clear"
+                    away = reminders.unattended_for(time.monotonic())
+                    # Show the wait counting up so a demo is obvious before
+                    # the first sentence is spoken. The banner takes over after that.
+                    if away is not None and reminders.reminder is None:
+                        state = f"{state}, away {describe_duration(away)}"
                     stove_label = f"STOVE {stove_change:.1f}% ({state})"
                 cv2.rectangle(
                     frame,
@@ -426,7 +535,7 @@ def main() -> None:
                 cv2.putText(
                     frame,
                     stove_label,
-                    (x, max(y - 8, 20)),
+                    (x, max(y - 8, 20 + top)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     ORANGE,
@@ -436,12 +545,15 @@ def main() -> None:
                 cv2.putText(
                     frame,
                     "Press S to draw the stove",
-                    (20, 75),
+                    (20, 75 + top),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
                     ORANGE,
                     2,
                 )
+
+            if reminders.reminder is not None:
+                draw_reminder(frame, reminders.reminder)
 
             # Show the six most recent events at the bottom of the camera view.
             for index, line in enumerate(recent_events):
