@@ -58,8 +58,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--cam",
         type=int,
-        default=1,
-        help="camera index to open (default: 1)",
+        default=0,
+        help="camera index to open (default: 0)",
     )
     parser.add_argument(
         "--zone",
@@ -244,7 +244,9 @@ def main() -> None:
 
     if not camera.isOpened():
         landmarker.close()
-        raise SystemExit(f"Camera {args.cam} didn't open. Try --cam 0")
+        raise SystemExit(
+            f"Camera {args.cam} didn't open. Try a different --cam number."
+        )
 
     # Debouncing prevents a brief missed detection from creating false events.
     confirmed_inside = False
