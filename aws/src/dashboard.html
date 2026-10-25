@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nudge caregiver</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1c1915;
+      --paper: #f7f4ef;
+      --card: #fffdf9;
+      --line: #e4ddd2;
+      --remind: #e7f2e4;
+      --escalate: #fde8d8;
+    }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", serif;
+      background: var(--paper);
+      color: var(--ink);
+      line-height: 1.45;
+    }
+    main {
+      max-width: 52rem;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+    }
+    h1 {
+      font-weight: normal;
+      font-size: 2rem;
+      margin-bottom: 0.25rem;
+    }
+    .note, #status {
+      max-width: 40rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--card);
+      margin-top: 1.5rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.7rem 0.8rem;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th {
+      font-family: "Segoe UI", sans-serif;
+      font-size: 0.85rem;
+      letter-spacing: 0.02em;
+    }
+    tr.remind { background: var(--remind); }
+    tr.escalate { background: var(--escalate); }
+    .kind {
+      font-family: "Segoe UI", sans-serif;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    p.reason { margin: 0.35rem 0 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Nudge caregiver</h1>
+    <p class="note">Frames never leave the device; only text events go to AWS, with caregiver consent.</p>
+    <p id="status">Loading recent events…</p>
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Time</th>
+          <th scope="col">What happened</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </main>
+  <script>
+    const token = new URLSearchParams(location.search).get("token") || "";
+    const status = document.getElementById("status");
+    const rows = document.getElementById("rows");
+
+    function escapeText(value) {
+      return String(value == null ? "" : value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function render(events) {
+      rows.replaceChildren();
+      if (!events.length) {
+        status.textContent = "No events yet. Nudges and escalations will show up here.";
+        return;
+      }
+      const escalations = events.filter((event) => event.event === "escalate" || event.action === "escalate").length;
+      const nudges = events.filter((event) => event.event === "remind" || event.action === "remind").length;
+      status.textContent = events.length + " recent events, " + nudges + " nudges, " + escalations + " escalations. This page refreshes every few seconds.";
+      for (const event of events) {
+        const row = document.createElement("tr");
+        const kind = event.event || event.action || "event";
+        if (kind === "escalate") row.className = "escalate";
+        else if (kind === "remind") row.className = "remind";
+        const when = document.createElement("td");
+        when.textContent = event.time || "";
+        const what = document.createElement("td");
+        what.innerHTML = '<div class="kind">' + escapeText(kind) + "</div><p class=\"reason\">"
+          + escapeText(event.observed || event.reason || "") + "</p>";
+        row.append(when, what);
+        rows.append(row);
+      }
+    }
+
+    async function load() {
+      if (!token) {
+        status.textContent = "This page is up. Add ?token= to the address to see events. Nothing is shown without it.";
+        return;
+      }
+      try {
+        const response = await fetch("/events?limit=50", {
+          headers: { "x-api-key": token },
+        });
+        if (!response.ok) {
+          status.textContent = "The event service refused this token (HTTP " + response.status + ").";
+          return;
+        }
+        const body = await response.json();
+        render(Array.isArray(body.events) ? body.events : []);
+      } catch (error) {
+        status.textContent = "Could not reach the event service. The camera keeps a local log either way.";
+      }
+    }
+
+    load();
+    if (token) setInterval(load, 5000);
+  </script>
+</body>
+</html>

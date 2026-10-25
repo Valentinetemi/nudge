@@ -1,0 +1,4 @@
+# Tools for tests and lint. The camera app itself does not import these.
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+pytest==8.4.2
+ruff==0.14.2

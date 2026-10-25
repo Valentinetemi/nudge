@@ -23,6 +23,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import cloud
 import nudge
 
 # Resolve files from the repository root instead of the terminal's current
@@ -43,6 +44,10 @@ MODEL_URL = (
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
 DEBOUNCE_SEC = 1.0
+
+# Set by main() once the cloud mode is known. None only before startup,
+# and in tests that never open a camera.
+active_cloud: cloud.CloudClient | None = None
 
 # The stove always has this fixed name so later steps can find it in zones.json.
 STOVE_ZONE = "stove"
@@ -200,13 +205,24 @@ def save_zones(zones: dict[str, Zone]) -> None:
     temporary_file.replace(ZONES_FILE)
 
 
-def log_event(event: str, observed: str, recent: list[str]) -> None:
-    """Append one machine-readable event and update the on-screen history."""
+def log_event(
+    event: str,
+    observed: str,
+    recent: list[str],
+    details: dict | None = None,
+) -> None:
+    """Append one machine-readable event and update the on-screen history.
+
+    The local file always gets the line. When a cloud client is active it
+    receives the same words, plus any caregiver numbers in `details`. Frames
+    are not a field this function accepts.
+    """
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "event": event,
         "observed": observed,
     }
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as log:
         log.write(json.dumps(entry) + "\n")
 
@@ -214,6 +230,12 @@ def log_event(event: str, observed: str, recent: list[str]) -> None:
     print(line)
     recent.append(line)
     del recent[:-6]  # Keep the display readable by showing only six events.
+
+    if active_cloud is not None:
+        payload = dict(entry)
+        if details:
+            payload.update(details)
+        active_cloud.send(payload)
 
 
 def log_decision(when: str, trace: str) -> None:
@@ -386,6 +408,15 @@ def main() -> None:
     )
     speaker = speak.Speaker()
     last_decision_log = 0.0
+    last_cloud_retry = 0.0
+    # The camera does not hide a bad NUDGE_CLOUD setting. The default is off,
+    # which keeps every event on this machine.
+    global active_cloud
+    active_cloud = cloud.CloudClient.from_env(
+        env_file=PROJECT_ROOT / ".env",
+        queue_path=DATA_DIR / "outbox.jsonl",
+    )
+    print(active_cloud.describe())
 
     if max_reminders is None:
         follow_up = "and keeps repeating the last reminder"
@@ -519,27 +550,66 @@ def main() -> None:
                 hands_nearby=hands_nearby.value,
                 now=now,
             )
-            if step.nudge is not None:
-                log_event("nudge", step.nudge.message, recent_events)
-                speaker.say(step.nudge.message)
-            elif step.escalate is not None:
-                log_event("escalate", step.escalate.message, recent_events)
-                speaker.say(step.escalate.message)
-            elif step.ended is not None:
-                log_event(
-                    "nudge_ended",
-                    nudge.ended_message(step.ended),
-                    recent_events,
-                )
-
-            # The file gets a line about once a second, and again whenever
-            # the rule speaks, asks a caregiver, or stops. The terminal
-            # already prints those three. Waits stay in the file.
             trace = reminders.describe(
                 now,
                 stove_occupied=stove_occupied.value,
                 hands_nearby=hands_nearby.value,
             )
+            away = reminders.unattended_for(now)
+            if step.nudge is not None:
+                log_event(
+                    "nudge",
+                    step.nudge.message,
+                    recent_events,
+                    details={
+                        "action": "remind",
+                        "prompt": step.nudge.message,
+                        "reason": step.nudge.message,
+                        "trace": trace,
+                        "away_seconds": away if away is not None else 0,
+                        "reminders_unanswered": step.nudge.level,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
+                )
+                speaker.say(step.nudge.message)
+            elif step.escalate is not None:
+                log_event(
+                    "escalate",
+                    step.escalate.message,
+                    recent_events,
+                    details={
+                        "action": "escalate",
+                        "prompt": step.escalate.message,
+                        "reason": step.escalate.message,
+                        "trace": trace,
+                        "away_seconds": step.escalate.away_seconds,
+                        "reminders_unanswered": step.escalate.reminders_unanswered,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
+                )
+                speaker.say(step.escalate.message)
+            elif step.ended is not None:
+                ended_text = nudge.ended_message(step.ended)
+                log_event(
+                    "nudge_ended",
+                    ended_text,
+                    recent_events,
+                    details={
+                        "action": "stand_down",
+                        "reason": ended_text,
+                        "trace": trace,
+                        "away_seconds": 0,
+                        "reminders_unanswered": 0,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
+                )
+
+            # The file gets a line about once a second, and again whenever
+            # the rule speaks, asks a caregiver, or stops. The terminal
+            # already prints those three. Waits stay in the file.
             acted = (
                 step.nudge is not None
                 or step.escalate is not None
@@ -549,6 +619,11 @@ def main() -> None:
                 when = datetime.now().isoformat(timespec="seconds")
                 log_decision(when, f"{when[11:]}  {trace}")
                 last_decision_log = now
+            # A dead API must not be contacted on every frame. The client
+            # also waits out its own cooldown after a failure.
+            if active_cloud is not None and now - last_cloud_retry >= 1.0:
+                active_cloud.retry_queued()
+                last_cloud_retry = now
 
             # A reminder banner covers the top of the picture, so other labels
             # start lower while one is showing.
