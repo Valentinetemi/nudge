@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Nudge caregiver API. The laptop sends small text events only.
+  Frames never leave the device. This stack stores those events,
+  shows them on a dashboard, and can notify an opted-in caregiver.
+
+# Deploy (the long version is in the README):
+#   cd aws
+#   sam build
+#   sam deploy --guided
+# Then confirm the SNS email, and put ApiUrl plus the keys in the laptop .env.
+# Do not commit samconfig.toml. It can contain the API keys.
+
+Parameters:
+  IngestApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: >
+      Secret the laptop sends in the x-api-key header. At least 20 characters.
+      Do not use local-dev-key. Do not commit this value.
+  DashboardToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Optional read token for the dashboard URL. Leave blank to reuse the
+      ingest key. A separate token is safer, because the dashboard link
+      contains it and should not be able to create events.
+  CaregiverNotifyEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|.+@.+"
+    Description: >
+      Optional email for escalation messages. AWS sends a confirmation the
+      caregiver must click. Leave blank to skip this and subscribe later.
+
+Conditions:
+  HasCaregiverEmail: !Not [!Equals [!Ref CaregiverNotifyEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Architectures:
+      - x86_64
+
+Resources:
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  CaregiverTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Nudge caregiver
+
+  # Email is opt-in: SNS will not deliver until the caregiver confirms.
+  CaregiverEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasCaregiverEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CaregiverTopic
+      Endpoint: !Ref CaregiverNotifyEmail
+
+  NudgeApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - content-type
+          - x-api-key
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+
+  EventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Description: Store text events and notify an opted-in caregiver.
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          CAREGIVER_TOPIC_ARN: !Ref CaregiverTopic
+          INGEST_API_KEY: !Ref IngestApiKey
+          DASHBOARD_TOKEN: !Ref DashboardToken
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref CaregiverTopic
+      Events:
+        GetRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NudgeApi
+            Path: /
+            Method: GET
+        GetHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NudgeApi
+            Path: /health
+            Method: GET
+        GetDashboard:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NudgeApi
+            Path: /dashboard
+            Method: GET
+        GetEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NudgeApi
+            Path: /events
+            Method: GET
+        PostEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NudgeApi
+            Path: /events
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Description: Base URL. Put this in NUDGE_API_URL with no path on the end.
+    Value: !GetAtt NudgeApi.ApiEndpoint
+  HealthUrl:
+    Description: Public page. It does not show caregiver events.
+    Value: !Sub
+      - "${Endpoint}/health"
+      - Endpoint: !GetAtt NudgeApi.ApiEndpoint
+  DashboardUrl:
+    Description: Add ?token=YOUR_DASHBOARD_TOKEN before sharing this URL.
+    Value: !Sub
+      - "${Endpoint}/dashboard"
+      - Endpoint: !GetAtt NudgeApi.ApiEndpoint
+  CaregiverTopicArn:
+    Description: Subscribe a confirmed email or phone number to this topic.
+    Value: !Ref CaregiverTopic
+  EventsTableName:
+    Description: DynamoDB table of text events. Items expire after 30 days.
+    Value: !Ref EventsTable

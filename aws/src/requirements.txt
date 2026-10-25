@@ -1,0 +1,3 @@
+# boto3 is already part of the Lambda runtime. Leaving this file empty on
+# purpose keeps the deployed package small. Add a pin here only if the
+# function starts importing something Lambda does not provide.
