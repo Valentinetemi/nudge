@@ -19,6 +19,7 @@ known-first-party = ["app", "cloud", "evaluate_stove", "main", "mock_cloud", "nu
 [tool.ruff.lint.per-file-ignores]
 # These modules insert a local path before importing the project.
 "tests/test_cloud.py" = ["E402"]
+"tests/test_eval.py" = ["E402"]
 "tests/test_lambda.py" = ["E402"]
 "scripts/mock_cloud.py" = ["E402"]
 "scripts/evaluate_stove.py" = ["E402"]

@@ -65,6 +65,12 @@ class ChangePercentTest(unittest.TestCase):
         changed = stove.change_percent(self.empty, brighten(self.empty))
         self.assertLess(changed, 1.0)
 
+    def test_without_normalization_a_light_looks_like_an_object(self) -> None:
+        # The raw helper is the evaluation "off" column. The camera does not
+        # use it. A brightness change should count there, and not above.
+        changed = stove.change_percent_raw(self.empty, brighten(self.empty))
+        self.assertGreaterEqual(changed, stove.OCCUPIED_PERCENT)
+
     def test_a_lighting_gradient_alone_does_not_look_occupied(self) -> None:
         changed = stove.change_percent(self.empty, side_light(self.empty))
         self.assertLess(changed, stove.OCCUPIED_PERCENT)
