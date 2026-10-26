@@ -1,0 +1,3 @@
+# Recorded clips stay out of git (see .gitignore). Put reference.png and the
+# clips named in eval/labels.csv in this folder on the machine that runs the
+# evaluation. Do not commit kitchen video unless you mean to.

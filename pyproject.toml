@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests", "scripts", "aws"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+# The project uses full-sentence comments. Wrapping those to 88 characters
+# makes them harder to read, so line length is left to review.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "cloud", "evaluate_stove", "main", "mock_cloud", "nudge", "record_clip", "speak", "stove"]
+
+[tool.ruff.lint.per-file-ignores]
+# These modules insert a local path before importing the project.
+"tests/test_cloud.py" = ["E402"]
+"tests/test_eval.py" = ["E402"]
+"tests/test_lambda.py" = ["E402"]
+"scripts/mock_cloud.py" = ["E402"]
+"scripts/evaluate_stove.py" = ["E402"]
+"scripts/record_clip.py" = ["E402"]

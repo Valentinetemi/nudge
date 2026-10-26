@@ -11,7 +11,9 @@ they can be reused later.
 
 A reminder is spoken when the stove still looks occupied and no hands have
 been in the hand zone or on the stove for a few minutes. It repeats a little
-more directly until the person comes back or the stove is clear.
+more directly. After those reminders go unanswered, Nudge asks a caregiver
+once. Coming back or clearing the stove stops the episode. Every check is
+also written to data/decisions.jsonl so the reason can be read later.
 """
 
 import argparse
@@ -21,6 +23,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import cloud
 import nudge
 
 # Resolve files from the repository root instead of the terminal's current
@@ -30,6 +33,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 MODEL_PATH = PROJECT_ROOT / "models" / "hand_landmarker.task"
 ZONES_FILE = DATA_DIR / "zones.json"
 LOG_FILE = DATA_DIR / "events.jsonl"
+# One JSON line per check of the rule, including the waits. Separate from
+# events.jsonl so the activity log stays short and the decision trace stays
+# complete.
+DECISIONS_FILE = DATA_DIR / "decisions.jsonl"
 STOVE_REFERENCE_FILE = DATA_DIR / "stove_reference.png"
 
 MODEL_URL = (
@@ -37,6 +44,10 @@ MODEL_URL = (
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
 DEBOUNCE_SEC = 1.0
+
+# Set by main() once the cloud mode is known. None only before startup,
+# and in tests that never open a camera.
+active_cloud: cloud.CloudClient | None = None
 
 # The stove always has this fixed name so later steps can find it in zones.json.
 STOVE_ZONE = "stove"
@@ -54,6 +65,19 @@ def parse_zone_name(value: str) -> str:
     if len(name) > 64:
         raise argparse.ArgumentTypeError("zone name must be 64 characters or fewer")
     return name
+
+
+def parse_max_reminders(value: str) -> int:
+    """How many spoken reminders happen before one caregiver request."""
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "max reminders must be a whole number"
+        ) from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("max reminders must be at least 1")
+    return count
 
 
 def parse_positive_seconds(value: str) -> float:
@@ -98,6 +122,20 @@ def parse_arguments() -> argparse.Namespace:
         type=parse_positive_seconds,
         default=nudge.DEFAULT_REPEAT_SECONDS,
         help="seconds between later reminders if nobody returns (default: 60)",
+    )
+    parser.add_argument(
+        "--max-reminders",
+        type=parse_max_reminders,
+        default=len(nudge.MESSAGES),
+        help=(
+            "spoken reminders before one caregiver request "
+            f"(default: {len(nudge.MESSAGES)})"
+        ),
+    )
+    parser.add_argument(
+        "--no-escalate",
+        action="store_true",
+        help="keep repeating the last reminder and do not ask a caregiver",
     )
     parser.add_argument(
         "--list-zones",
@@ -167,13 +205,24 @@ def save_zones(zones: dict[str, Zone]) -> None:
     temporary_file.replace(ZONES_FILE)
 
 
-def log_event(event: str, observed: str, recent: list[str]) -> None:
-    """Append one machine-readable event and update the on-screen history."""
+def log_event(
+    event: str,
+    observed: str,
+    recent: list[str],
+    details: dict | None = None,
+) -> None:
+    """Append one machine-readable event and update the on-screen history.
+
+    The local file always gets the line. When a cloud client is active it
+    receives the same words, plus any caregiver numbers in `details`. Frames
+    are not a field this function accepts.
+    """
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "event": event,
         "observed": observed,
     }
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as log:
         log.write(json.dumps(entry) + "\n")
 
@@ -181,6 +230,20 @@ def log_event(event: str, observed: str, recent: list[str]) -> None:
     print(line)
     recent.append(line)
     del recent[:-6]  # Keep the display readable by showing only six events.
+
+    if active_cloud is not None:
+        payload = dict(entry)
+        if details:
+            payload.update(details)
+        active_cloud.send(payload)
+
+
+def log_decision(when: str, trace: str) -> None:
+    """Append one readable decision. `trace` is already a sentence of facts."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    record = {"time": when, "trace": trace}
+    with DECISIONS_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
 
 
 def count_hands_in_zone(
@@ -335,14 +398,36 @@ def main() -> None:
     # one-second debounce as the event log, so a missed frame does not
     # restart the reminder clock.
     hands_nearby = stove.Debounced(DEBOUNCE_SEC)
-    reminders = nudge.NudgeRule(args.nudge_after, args.nudge_repeat)
+    # Omitting the limit keeps the original behavior: the last reminder
+    # repeats for as long as the stove stays unattended.
+    max_reminders = None if args.no_escalate else args.max_reminders
+    reminders = nudge.NudgeRule(
+        args.nudge_after,
+        args.nudge_repeat,
+        max_reminders=max_reminders,
+    )
     speaker = speak.Speaker()
+    last_decision_log = 0.0
+    last_cloud_retry = 0.0
+    # The camera does not hide a bad NUDGE_CLOUD setting. The default is off,
+    # which keeps every event on this machine.
+    global active_cloud
+    active_cloud = cloud.CloudClient.from_env(
+        env_file=PROJECT_ROOT / ".env",
+        queue_path=DATA_DIR / "outbox.jsonl",
+    )
+    print(active_cloud.describe())
 
+    if max_reminders is None:
+        follow_up = "and keeps repeating the last reminder"
+    else:
+        follow_up = f"then asks a caregiver after {max_reminders} reminders"
     log_event(
         "nudge_started",
         (
             f'Nudge started watching zone "{zone_name}" '
-            f"(reminder after {describe_duration(args.nudge_after)} unattended)"
+            f"(reminder after {describe_duration(args.nudge_after)} unattended, "
+            f"{follow_up})"
         ),
         recent_events,
     )
@@ -465,15 +550,80 @@ def main() -> None:
                 hands_nearby=hands_nearby.value,
                 now=now,
             )
+            trace = reminders.describe(
+                now,
+                stove_occupied=stove_occupied.value,
+                hands_nearby=hands_nearby.value,
+            )
+            away = reminders.unattended_for(now)
             if step.nudge is not None:
-                log_event("nudge", step.nudge.message, recent_events)
+                log_event(
+                    "nudge",
+                    step.nudge.message,
+                    recent_events,
+                    details={
+                        "action": "remind",
+                        "prompt": step.nudge.message,
+                        "reason": step.nudge.message,
+                        "trace": trace,
+                        "away_seconds": away if away is not None else 0,
+                        "reminders_unanswered": step.nudge.level,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
+                )
                 speaker.say(step.nudge.message)
+            elif step.escalate is not None:
+                log_event(
+                    "escalate",
+                    step.escalate.message,
+                    recent_events,
+                    details={
+                        "action": "escalate",
+                        "prompt": step.escalate.message,
+                        "reason": step.escalate.message,
+                        "trace": trace,
+                        "away_seconds": step.escalate.away_seconds,
+                        "reminders_unanswered": step.escalate.reminders_unanswered,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
+                )
+                speaker.say(step.escalate.message)
             elif step.ended is not None:
+                ended_text = nudge.ended_message(step.ended)
                 log_event(
                     "nudge_ended",
-                    nudge.ended_message(step.ended),
+                    ended_text,
                     recent_events,
+                    details={
+                        "action": "stand_down",
+                        "reason": ended_text,
+                        "trace": trace,
+                        "away_seconds": 0,
+                        "reminders_unanswered": 0,
+                        "stove_occupied": stove_occupied.value,
+                        "hands_present": hands_nearby.value,
+                    },
                 )
+
+            # The file gets a line about once a second, and again whenever
+            # the rule speaks, asks a caregiver, or stops. The terminal
+            # already prints those three. Waits stay in the file.
+            acted = (
+                step.nudge is not None
+                or step.escalate is not None
+                or step.ended is not None
+            )
+            if acted or now - last_decision_log >= 1.0:
+                when = datetime.now().isoformat(timespec="seconds")
+                log_decision(when, f"{when[11:]}  {trace}")
+                last_decision_log = now
+            # A dead API must not be contacted on every frame. The client
+            # also waits out its own cooldown after a failure.
+            if active_cloud is not None and now - last_cloud_retry >= 1.0:
+                active_cloud.retry_queued()
+                last_cloud_retry = now
 
             # A reminder banner covers the top of the picture, so other labels
             # start lower while one is showing.

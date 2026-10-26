@@ -1,0 +1,14 @@
+# Copy this file to eval/labels.csv and replace the comments with real clips.
+# Film the stove so it fills the frame the same way in every file, including
+# the empty reference still at eval/clips/reference.png.
+#
+# file,label,hands
+# label is occupied or clear
+# hands is present or absent, and is only used for time-to-first-nudge
+#
+# empty_daylight.mp4,clear,absent
+# empty_lamp_on.mp4,clear,absent
+# pot_on_burner.mp4,occupied,absent
+# pot_dim_room.mp4,occupied,absent
+# hands_still_cooking.mp4,occupied,present
+file,label,hands

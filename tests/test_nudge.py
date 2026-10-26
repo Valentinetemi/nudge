@@ -159,6 +159,68 @@ class NudgeRuleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             nudge.ended_message("nope")
 
+    def test_unanswered_reminders_escalate_once(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=2)
+        checker.update(True, False, 0)
+        first = checker.update(True, False, 10)
+        self.assertIsNotNone(first.nudge)
+        self.assertIsNone(first.escalate)
+        second = checker.update(True, False, 15)
+        assert second.nudge is not None
+        self.assertEqual(second.nudge.level, 2)
+        ask = checker.update(True, False, 20)
+        self.assertIsNone(ask.nudge)
+        assert ask.escalate is not None
+        self.assertEqual(ask.escalate.reminders_unanswered, 2)
+        self.assertIn("caregiver", ask.escalate.message)
+        self.assertNotIn("already notified", ask.escalate.message)
+        # Still unattended. Do not ask again on the next interval.
+        later = checker.update(True, False, 40)
+        self.assertIsNone(later.nudge)
+        self.assertIsNone(later.escalate)
+        self.assertEqual(checker.reminder, nudge.ESCALATION_MESSAGE)
+
+    def test_coming_back_after_an_escalation_starts_a_new_wait(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=1)
+        checker.update(True, False, 0)
+        checker.update(True, False, 10)
+        ask = checker.update(True, False, 15)
+        self.assertIsNotNone(ask.escalate)
+        back = checker.update(True, True, 16)
+        self.assertEqual(back.ended, "returned")
+        self.assertIsNone(checker.reminder)
+        checker.update(True, False, 16)
+        self.assertIsNone(checker.update(True, False, 25).nudge)
+        again = checker.update(True, False, 26)
+        assert again.nudge is not None
+        self.assertEqual(again.nudge.level, 1)
+        self.assertIsNone(again.escalate)
+
+    def test_the_decision_trace_names_the_camera_facts(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=2)
+        checker.update(True, False, 0)
+        checker.update(True, False, 10)
+        line = checker.describe(10, stove_occupied=True, hands_nearby=False)
+        self.assertTrue(line.startswith("REMIND"))
+        self.assertIn("stove occupied", line)
+        self.assertIn("hands away", line)
+        self.assertIn("away for 10s", line)
+        self.assertIn("1 reminder unanswered", line)
+
+    def test_without_a_limit_the_rule_does_not_escalate(self) -> None:
+        checker = rule(wait=10, repeat=5)
+        checker.update(True, False, 0)
+        moment = 10
+        for _ in range(6):
+            step = checker.update(True, False, moment)
+            self.assertIsNotNone(step.nudge)
+            self.assertIsNone(step.escalate)
+            moment += 5
+
+    def test_max_reminders_must_be_at_least_one(self) -> None:
+        with self.assertRaises(ValueError):
+            nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=0)
+
 
 if __name__ == "__main__":
     unittest.main()

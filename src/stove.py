@@ -79,12 +79,26 @@ def change_percent(reference: np.ndarray, current: np.ndarray) -> float:
     """Return the percentage of pixels that differ clearly from the reference.
 
     Lighting is normalized first, so a light switched on or off does not by
-    itself look like an object was set down.
+    itself look like an object was set down. This is what the camera uses.
     """
-    difference = cv2.absdiff(
+    return _changed_percent(
         normalize_lighting(reference),
         normalize_lighting(current),
     )
+
+
+def change_percent_raw(reference: np.ndarray, current: np.ndarray) -> float:
+    """Same comparison as `change_percent`, with lighting left in the picture.
+
+    The live camera does not call this. The clip report uses it as the
+    "normalization off" column, so a real recording can show the difference.
+    """
+    return _changed_percent(reference, current)
+
+
+def _changed_percent(reference: np.ndarray, current: np.ndarray) -> float:
+    """Percentage of pixels that differ, after the caller has prepared them."""
+    difference = cv2.absdiff(reference, current)
     _, changed = cv2.threshold(
         difference, PIXEL_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY
     )

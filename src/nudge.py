@@ -14,6 +14,12 @@ DEFAULT_WAIT_SECONDS = 180.0
 # Later reminders come sooner than the first wait, and they stay polite.
 DEFAULT_REPEAT_SECONDS = 60.0
 
+# Spoken in the room when the reminders have gone unanswered. This asks a
+# person for help. It does not claim the message has already been delivered.
+ESCALATION_MESSAGE = (
+    "I haven't seen you come back, so I'm letting your caregiver know."
+)
+
 # Each step is a little more direct, then we stay on the last wording.
 # These sentences may be read aloud to someone who is confused, so they
 # never scold.
@@ -50,16 +56,31 @@ class Nudge:
 
 
 @dataclass(frozen=True)
+class Escalation:
+    """Ask an opted-in caregiver, once, after the spoken reminders run out.
+
+    `message` is what to say in the room. Delivery to the caregiver is a
+    separate step. This object only records that the ask is due.
+    """
+
+    reminders_unanswered: int
+    away_seconds: float
+    message: str
+
+
+@dataclass(frozen=True)
 class Step:
     """What to do after one check of the stove and the hands.
 
-    `nudge` is set when a reminder is due right now. `ended` is "returned"
-    or "clear" when a reminder that was already showing has just stopped.
-    Both are None when the screen should be left as it is.
+    `nudge` is set when a reminder is due right now. `escalate` is set once,
+    after the configured reminders have gone unanswered. `ended` is
+    "returned" or "clear" when a reminder that was already showing has just
+    stopped. All three are None when the screen should be left as it is.
     """
 
     nudge: Nudge | None = None
     ended: str | None = None
+    escalate: Escalation | None = None
 
 
 class NudgeRule:
@@ -69,21 +90,31 @@ class NudgeRule:
     nearby. A person coming back, or the stove becoming clear, forgets the
     reminder. The next time someone walks away, the full wait starts over
     instead of jumping straight to a repeat.
+
+    Pass `max_reminders` to ask a caregiver once those reminders go
+    unanswered. Leave it out and the last calm sentence keeps repeating.
     """
 
     def __init__(
         self,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         repeat_seconds: float = DEFAULT_REPEAT_SECONDS,
+        max_reminders: int | None = None,
     ) -> None:
         if wait_seconds <= 0 or repeat_seconds <= 0:
             raise ValueError("wait and repeat times must be greater than zero")
+        # None keeps repeating the last calm sentence. A number asks a
+        # caregiver once the spoken reminders have gone unanswered.
+        if max_reminders is not None and max_reminders < 1:
+            raise ValueError("max_reminders must be at least 1, or omitted")
         self.wait_seconds = wait_seconds
         self.repeat_seconds = repeat_seconds
+        self.max_reminders = max_reminders
         self.level = 0
         self._unattended_since: float | None = None
         self._last_nudge_at: float | None = None
         self._reminder: str | None = None
+        self._escalated = False
 
     @property
     def reminder(self) -> str | None:
@@ -114,6 +145,11 @@ class NudgeRule:
             self._unattended_since = now
             return Step()
 
+        if self._escalated:
+            # One request per absence. Coming back or clearing the stove
+            # is what starts a new episode.
+            return Step()
+
         if self.level == 0:
             due = now - self._unattended_since >= self.wait_seconds
         elif self._last_nudge_at is None:
@@ -123,7 +159,31 @@ class NudgeRule:
 
         if not due:
             return Step()
+        if self.max_reminders is not None and self.level >= self.max_reminders:
+            return Step(escalate=self._escalate(now))
         return Step(nudge=self._fire(now))
+
+    def describe(self, now: float, stove_occupied: bool, hands_nearby: bool) -> str:
+        """One readable line for the decision log. No image data."""
+        away = self.unattended_for(now)
+        if away is None:
+            away_text = "not unattended"
+        else:
+            away_text = f"away for {int(away)}s"
+        if self._escalated:
+            state = "ESCALATE"
+        elif self._reminder is not None:
+            state = "REMIND"
+        else:
+            state = "WAIT"
+        reminders = (
+            "1 reminder unanswered"
+            if self.level == 1
+            else f"{self.level} reminders unanswered"
+        )
+        stove = "stove occupied" if stove_occupied else "stove clear"
+        hands = "hands nearby" if hands_nearby else "hands away"
+        return f"{state:<10} {stove}, {hands}, {away_text}, {reminders}"
 
     def _stop(self, stove_occupied: bool) -> Step:
         ended = None
@@ -134,7 +194,18 @@ class NudgeRule:
         self._unattended_since = None
         self._last_nudge_at = None
         self._reminder = None
+        self._escalated = False
         return Step(ended=ended)
+
+    def _escalate(self, now: float) -> Escalation:
+        self._escalated = True
+        away = self.unattended_for(now) or 0.0
+        self._reminder = ESCALATION_MESSAGE
+        return Escalation(
+            reminders_unanswered=self.level,
+            away_seconds=away,
+            message=ESCALATION_MESSAGE,
+        )
 
     def _fire(self, now: float) -> Nudge:
         self.level += 1

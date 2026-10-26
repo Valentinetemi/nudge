@@ -15,5 +15,15 @@ __pycache__/
 # Personal runtime data: zones, event log, stove reference, snapshots
 data/
 
-# Secrets
+# Kitchen clips and a local copy of the evaluation printout.
+# The results table in the README is filled in by hand from a real run.
+eval/clips/*
+!eval/clips/.gitkeep
+eval/last_results.md
+
+# Secrets. sam deploy --guided writes the API keys into samconfig.toml.
 .env
+aws/samconfig.toml
+
+# AWS SAM build output
+.aws-sam/
