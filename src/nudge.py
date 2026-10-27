@@ -1,10 +1,13 @@
 """Decide when to gently remind someone about an unattended stove.
 
-This file is only the rule. It does not open the camera, play a sound, or
-write the event log, so it can be tested by handing it times and yes/no
-readings.
+This file is the reminder clock. It does not open the camera, play a sound,
+or write the event log, so it can be tested by handing it times and yes/no
+readings. An optional advisor may choose the words and whether to escalate
+at a moment the clock already calls due. The advisor is not called on the
+waits in between. If it is missing or fails, the built-in ladder speaks.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # A few minutes is long enough to step away for a spoon, and short enough
@@ -53,19 +56,62 @@ class Nudge:
 
     level: int
     message: str
+    # calm, direct, or firm. The canned ladder uses calm, then direct, then firm.
+    urgency: str = "calm"
 
 
 @dataclass(frozen=True)
 class Escalation:
     """Ask an opted-in caregiver, once, after the spoken reminders run out.
 
-    `message` is what to say in the room. Delivery to the caregiver is a
-    separate step. This object only records that the ask is due.
+    `message` is what to say in the room. `caregiver_summary` is the text
+    for the caregiver. Delivery is a separate step. This object only
+    records that the ask is due.
     """
 
     reminders_unanswered: int
     away_seconds: float
     message: str
+    caregiver_summary: str = ""
+    urgency: str = "firm"
+
+
+@dataclass(frozen=True)
+class Situation:
+    """Facts a model may use at a moment when a reminder is already due.
+
+    These are numbers and short sentences. There is no image in here.
+    """
+
+    stove_occupied: bool
+    hands_nearby: bool
+    away_seconds: float
+    reminders_given: int
+    max_reminders: int | None
+    escalate_allowed: bool
+    rule_would: str
+    last_message: str | None
+    wait_seconds: float
+    repeat_seconds: float
+
+
+@dataclass(frozen=True)
+class Advice:
+    """A model's choice for one due moment. The rule still applies the caps."""
+
+    action: str
+    urgency: str
+    message: str
+    caregiver_summary: str
+    model: str
+
+
+@dataclass(frozen=True)
+class ReasoningResult:
+    """Either a model decision or a reason the rules should speak instead."""
+
+    advice: Advice | None = None
+    fallback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,11 +122,20 @@ class Step:
     after the configured reminders have gone unanswered. `ended` is
     "returned" or "clear" when a reminder that was already showing has just
     stopped. All three are None when the screen should be left as it is.
+
+    `source` is "rule" for the built-in ladder and "nemotron" when the model
+    chose the step. `fallback` is set when the model was asked and could not
+    answer, so the ladder spoke instead. `note` records a safety cap that
+    changed the model's action.
     """
 
     nudge: Nudge | None = None
     ended: str | None = None
     escalate: Escalation | None = None
+    source: str = "rule"
+    model: str | None = None
+    fallback: str | None = None
+    note: str | None = None
 
 
 class NudgeRule:
@@ -132,11 +187,21 @@ class NudgeRule:
             return None
         return max(0.0, now - self._unattended_since)
 
-    def update(self, stove_occupied: bool, hands_nearby: bool, now: float) -> Step:
+    def update(
+        self,
+        stove_occupied: bool,
+        hands_nearby: bool,
+        now: float,
+        advisor: Callable[[Situation], ReasoningResult] | None = None,
+    ) -> Step:
         """Take the latest confirmed readings and say what should happen.
 
         Pass debounced readings, not a single camera frame. A one-frame miss
         from the hand tracker would otherwise restart the wait.
+
+        `advisor`, when set, is asked only at a moment the clock already
+        calls due. It may choose the spoken words and whether to escalate.
+        If it returns no advice, or raises, the built-in ladder speaks.
         """
         if not stove_occupied or hands_nearby:
             return self._stop(stove_occupied)
@@ -159,9 +224,27 @@ class NudgeRule:
 
         if not due:
             return Step()
-        if self.max_reminders is not None and self.level >= self.max_reminders:
-            return Step(escalate=self._escalate(now))
-        return Step(nudge=self._fire(now))
+        if advisor is not None:
+            # The clock already says something should happen. The model may
+            # choose the words and whether this is the caregiver ask. A miss
+            # keeps the ladder below.
+            try:
+                result = advisor(self.situation(now, stove_occupied, hands_nearby))
+            except Exception as error:
+                result = ReasoningResult(
+                    fallback=(
+                        "Nemotron step failed "
+                        f"({type(error).__name__}); using the reminder rules"
+                    )
+                )
+            if not isinstance(result, ReasoningResult):
+                result = ReasoningResult(
+                    fallback="Nemotron step returned nothing; using the reminder rules"
+                )
+            if result.advice is not None:
+                return self._apply_advice(result.advice, now)
+            return self._due_from_rules(now, fallback=result.fallback)
+        return self._due_from_rules(now)
 
     def describe(self, now: float, stove_occupied: bool, hands_nearby: bool) -> str:
         """One readable line for the decision log. No image data."""
@@ -185,6 +268,88 @@ class NudgeRule:
         hands = "hands nearby" if hands_nearby else "hands away"
         return f"{state:<10} {stove}, {hands}, {away_text}, {reminders}"
 
+    def situation(self, now: float, stove_occupied: bool, hands_nearby: bool) -> Situation:
+        """The facts available at this moment, for a model or for the log."""
+        away = self.unattended_for(now) or 0.0
+        if self.max_reminders is not None and self.level >= self.max_reminders:
+            rule_would = "escalate"
+        else:
+            rule_would = "remind"
+        return Situation(
+            stove_occupied=stove_occupied,
+            hands_nearby=hands_nearby,
+            away_seconds=away,
+            reminders_given=self.level,
+            max_reminders=self.max_reminders,
+            escalate_allowed=self.max_reminders is not None,
+            rule_would=rule_would,
+            last_message=self._reminder,
+            wait_seconds=self.wait_seconds,
+            repeat_seconds=self.repeat_seconds,
+        )
+
+    def _due_from_rules(self, now: float, fallback: str | None = None) -> Step:
+        if self.max_reminders is not None and self.level >= self.max_reminders:
+            return Step(
+                escalate=self._escalate(now),
+                source="rule",
+                fallback=fallback,
+            )
+        return Step(nudge=self._fire(now), source="rule", fallback=fallback)
+
+    def _apply_advice(self, advice: Advice, now: float) -> Step:
+        """Use the model's words, then apply the same safety caps as the rules.
+
+        The room hears a reminder before any caregiver ask. `--no-escalate`
+        cannot be overridden. Once the reminder cap is reached, a model that
+        wants another reminder still produces the one caregiver ask, and the
+        model's summary is kept when it wrote one.
+        """
+        action = advice.action
+        message = advice.message
+        summary = advice.caregiver_summary
+        note = None
+        coerced_to_remind = False
+        if action == "escalate" and self.max_reminders is None:
+            action = "remind"
+            coerced_to_remind = True
+            note = "Escalation is turned off, so this stays a reminder."
+        elif action == "escalate" and self.level < 1:
+            action = "remind"
+            coerced_to_remind = True
+            note = "The room has not heard a reminder yet, so this stays a reminder."
+        if coerced_to_remind and "caregiver" in message.lower():
+            # The model wrote an ask, but this moment is still a reminder.
+            # Saying the caregiver is being told would be false.
+            message = message_for_level(self.level + 1)
+        elif (
+            action != "escalate"
+            and self.max_reminders is not None
+            and self.level >= self.max_reminders
+        ):
+            action = "escalate"
+            note = "The reminder cap is reached, so this asks the caregiver."
+            if "caregiver" not in message.lower():
+                message = ESCALATION_MESSAGE
+            if not summary:
+                summary = _rule_summary(self.unattended_for(now) or 0.0, self.level)
+
+        if action == "escalate":
+            escalation = self._escalate(
+                now,
+                message=message,
+                summary=summary,
+                urgency=advice.urgency or "firm",
+            )
+            return Step(
+                escalate=escalation,
+                source="nemotron",
+                model=advice.model,
+                note=note,
+            )
+        nudge = self._fire(now, message=message, urgency=advice.urgency or "calm")
+        return Step(nudge=nudge, source="nemotron", model=advice.model, note=note)
+
     def _stop(self, stove_occupied: bool) -> Step:
         ended = None
         if self._reminder is not None:
@@ -197,19 +362,51 @@ class NudgeRule:
         self._escalated = False
         return Step(ended=ended)
 
-    def _escalate(self, now: float) -> Escalation:
+    def _escalate(
+        self,
+        now: float,
+        message: str | None = None,
+        summary: str = "",
+        urgency: str = "firm",
+    ) -> Escalation:
         self._escalated = True
         away = self.unattended_for(now) or 0.0
-        self._reminder = ESCALATION_MESSAGE
+        spoken = message or ESCALATION_MESSAGE
+        self._reminder = spoken
         return Escalation(
             reminders_unanswered=self.level,
             away_seconds=away,
-            message=ESCALATION_MESSAGE,
+            message=spoken,
+            caregiver_summary=summary,
+            urgency=urgency,
         )
 
-    def _fire(self, now: float) -> Nudge:
+    def _fire(self, now: float, message: str | None = None, urgency: str | None = None) -> Nudge:
         self.level += 1
         self._last_nudge_at = now
-        message = message_for_level(self.level)
-        self._reminder = message
-        return Nudge(level=self.level, message=message)
+        spoken = message or message_for_level(self.level)
+        self._reminder = spoken
+        return Nudge(
+            level=self.level,
+            message=spoken,
+            urgency=urgency or _urgency_for_level(self.level),
+        )
+
+
+def _urgency_for_level(level: int) -> str:
+    """The canned ladder gets a little more direct, then stays there."""
+    if level <= 1:
+        return "calm"
+    if level == 2:
+        return "direct"
+    return "firm"
+
+
+def _rule_summary(away_seconds: float, reminders: int) -> str:
+    """A factual caregiver line used when the model did not write one."""
+    reminder_word = "reminder" if reminders == 1 else "reminders"
+    return (
+        f"The stove has been unattended for {int(away_seconds)} seconds "
+        f"after {reminders} {reminder_word}. "
+        "The reminder cap required this ask."
+    )

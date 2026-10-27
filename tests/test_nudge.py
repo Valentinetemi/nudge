@@ -221,6 +221,140 @@ class NudgeRuleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=0)
 
+    def test_the_model_is_not_asked_before_the_wait_is_up(self) -> None:
+        checker = rule(wait=10, repeat=5)
+        asked: list[nudge.Situation] = []
+
+        def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
+            asked.append(facts)
+            return nudge.ReasoningResult(fallback="should not be asked yet")
+
+        checker.update(True, False, 0, advisor=advisor)
+        checker.update(True, False, 9, advisor=advisor)
+        self.assertEqual(asked, [])
+
+    def test_the_model_can_choose_the_reminder_wording(self) -> None:
+        checker = rule(wait=10, repeat=5)
+        checker.update(True, False, 0)
+        step = checker.update(True, False, 10, advisor=_remind("The pot is still on the stove."))
+        assert step.nudge is not None
+        self.assertEqual(step.nudge.message, "The pot is still on the stove.")
+        self.assertEqual(step.nudge.urgency, "direct")
+        self.assertEqual(step.source, "nemotron")
+        self.assertEqual(step.model, "nvidia/nemotron-3-super-120b-a12b")
+        self.assertIsNone(step.fallback)
+        self.assertEqual(checker.reminder, step.nudge.message)
+
+    def test_the_model_can_escalate_after_a_reminder(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=4)
+        checker.update(True, False, 0)
+        first = checker.update(True, False, 10, advisor=_remind("Please glance at the stove."))
+        self.assertIsNotNone(first.nudge)
+        step = checker.update(True, False, 15, advisor=_escalate())
+        self.assertIsNone(step.nudge)
+        assert step.escalate is not None
+        self.assertEqual(step.source, "nemotron")
+        self.assertEqual(step.escalate.reminders_unanswered, 1)
+        self.assertIn("240", step.escalate.caregiver_summary)
+        self.assertIn("caregiver", step.escalate.message)
+        self.assertNotIn("already notified", step.escalate.message)
+        # One ask. The next interval does not ask again.
+        later = checker.update(True, False, 30, advisor=_escalate())
+        self.assertIsNone(later.escalate)
+        self.assertIsNone(later.nudge)
+
+    def test_the_first_moment_stays_a_reminder_even_if_the_model_escalates(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=4)
+        checker.update(True, False, 0)
+        step = checker.update(True, False, 10, advisor=_escalate())
+        assert step.nudge is not None
+        self.assertIsNone(step.escalate)
+        self.assertEqual(step.source, "nemotron")
+        self.assertIn("not heard a reminder", step.note or "")
+        self.assertEqual(step.nudge.level, 1)
+        self.assertEqual(step.nudge.message, nudge.MESSAGES[0])
+        self.assertNotIn("caregiver", step.nudge.message)
+
+    def test_the_reminder_cap_still_asks_the_caregiver(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=1)
+        checker.update(True, False, 0)
+        checker.update(True, False, 10, advisor=_remind("Something is still on the stove."))
+        step = checker.update(True, False, 15, advisor=_remind("One more look at the stove."))
+        self.assertIsNone(step.nudge)
+        assert step.escalate is not None
+        self.assertEqual(step.source, "nemotron")
+        self.assertIn("cap", step.note or "")
+        self.assertIn("caregiver", step.escalate.message)
+        self.assertTrue(step.escalate.caregiver_summary)
+
+    def test_escalation_stays_off_when_the_flag_says_so(self) -> None:
+        checker = rule(wait=10, repeat=5)
+        checker.update(True, False, 0)
+        checker.update(True, False, 10, advisor=_remind("Something is still on the stove."))
+        step = checker.update(True, False, 15, advisor=_escalate())
+        assert step.nudge is not None
+        self.assertIsNone(step.escalate)
+        self.assertIn("turned off", step.note or "")
+        self.assertNotIn("caregiver", step.nudge.message)
+
+    def test_a_model_miss_uses_the_canned_reminder_and_records_why(self) -> None:
+        checker = rule(wait=10, repeat=5)
+
+        def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
+            return nudge.ReasoningResult(fallback="Nebius call timed out; using the reminder rules")
+
+        checker.update(True, False, 0)
+        step = checker.update(True, False, 10, advisor=advisor)
+        assert step.nudge is not None
+        self.assertEqual(step.nudge.message, nudge.MESSAGES[0])
+        self.assertEqual(step.source, "rule")
+        self.assertIn("timed out", step.fallback or "")
+
+    def test_an_advisor_that_raises_falls_back(self) -> None:
+        checker = rule(wait=10, repeat=5)
+
+        def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
+            raise RuntimeError("connection reset")
+
+        checker.update(True, False, 0)
+        step = checker.update(True, False, 10, advisor=advisor)
+        assert step.nudge is not None
+        self.assertEqual(step.nudge.message, nudge.MESSAGES[0])
+        self.assertIn("RuntimeError", step.fallback or "")
+        self.assertNotIn("connection reset", step.fallback or "")
+
+
+def _remind(message: str):
+    def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
+        return nudge.ReasoningResult(
+            advice=nudge.Advice(
+                action="remind",
+                urgency="direct",
+                message=message,
+                caregiver_summary="",
+                model="nvidia/nemotron-3-super-120b-a12b",
+            )
+        )
+
+    return advisor
+
+
+def _escalate():
+    def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
+        return nudge.ReasoningResult(
+            advice=nudge.Advice(
+                action="escalate",
+                urgency="firm",
+                message="I haven't seen you come back, so I'm letting your caregiver know.",
+                caregiver_summary=(
+                    "The stove has been unattended for 240 seconds after 2 reminders."
+                ),
+                model="nvidia/nemotron-3-super-120b-a12b",
+            )
+        )
+
+    return advisor
+
 
 if __name__ == "__main__":
     unittest.main()
