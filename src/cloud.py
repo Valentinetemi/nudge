@@ -47,6 +47,13 @@ TEXT_FIELDS = {
     "prompt",
     "phase",
     "trace",
+    # Written by the Nemotron step. Still text. Still no picture.
+    "caregiver_summary",
+    "urgency",
+    "model",
+    "source",
+    "fallback",
+    "note",
 }
 NUMBER_FIELDS = {"away_seconds", "reminders_unanswered"}
 BOOL_FIELDS = {"stove_occupied", "hands_present"}

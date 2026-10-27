@@ -45,6 +45,12 @@ TEXT_FIELDS = {
     "prompt",
     "phase",
     "trace",
+    "caregiver_summary",
+    "urgency",
+    "model",
+    "source",
+    "fallback",
+    "note",
 }
 NUMBER_FIELDS = {"away_seconds", "reminders_unanswered"}
 BOOL_FIELDS = {"stove_occupied", "hands_present"}
@@ -133,13 +139,17 @@ def escalation_message(event: dict) -> str:
     observed = event.get("observed") or event.get("reason") or "The stove may be unattended."
     reminders = event.get("reminders_unanswered", "unknown")
     away = event.get("away_seconds", "unknown")
-    return (
-        f"Nudge escalation from {device}.\n"
-        f"{observed}\n"
-        f"Reminders unanswered: {reminders}. Away for about {away} seconds.\n"
-        "No video was included.\n"
-        f"{PRIVACY_SENTENCE}"
-    )
+    summary = event.get("caregiver_summary") or ""
+    lines = [
+        f"Nudge escalation from {device}.",
+        str(observed),
+    ]
+    if summary:
+        lines.append(str(summary))
+    lines.append(f"Reminders unanswered: {reminders}. Away for about {away} seconds.")
+    lines.append("No video was included.")
+    lines.append(PRIVACY_SENTENCE)
+    return "\n".join(lines)
 
 
 def to_item(event: dict) -> dict:

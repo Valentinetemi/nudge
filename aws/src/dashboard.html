@@ -108,6 +108,9 @@
         const what = document.createElement("td");
         what.innerHTML = '<div class="kind">' + escapeText(kind) + "</div><p class=\"reason\">"
           + escapeText(event.observed || event.reason || "") + "</p>";
+        if (event.caregiver_summary) {
+          what.innerHTML += '<p class="reason">' + escapeText(event.caregiver_summary) + "</p>";
+        }
         row.append(when, what);
         rows.append(row);
       }
