@@ -23,6 +23,7 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import nudge
@@ -36,26 +37,26 @@ DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 # host is for other models; this one is served from us-central1.
 DEFAULT_BASE_URL = "https://api.tokenfactory.us-central1.nebius.com/v1"
 
+# Exact Token Factory API hosts. This is not a suffix check: a lookalike
+# such as api.tokenfactory.nebius.com.evil.example is refused, and so is
+# any http:// URL. The bearer token is never sent until this matches.
+ALLOWED_HOSTS = frozenset(
+    {
+        "api.tokenfactory.nebius.com",
+        "api.tokenfactory.us-central1.nebius.com",
+        "api.tokenfactory.us-north1.nebius.com",
+        "api.tokenfactory.eu-north1.nebius.com",
+        "api.tokenfactory.eu-west2.nebius.com",
+        "api.tokenfactory.uk-south1.nebius.com",
+    }
+)
+
 # Long enough for a short reasoning trace plus the JSON object, short
 # enough that a stuck call gives the camera loop back to the rules.
 DEFAULT_TIMEOUT_SEC = 20.0
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
-
-# Spoken lines are said to someone who may be confused. These phrases
-# either scold or claim the caregiver has already been told.
-_FORBIDDEN = (
-    "already notified",
-    "already told",
-    "have notified",
-    "has been notified",
-    "i notified",
-    "stupid",
-    "idiot",
-    "careless",
-    "dumb",
-)
 
 _URGENCY = {
     "calm": "calm",
@@ -71,6 +72,40 @@ _URGENCY = {
 
 class ReasoningError(Exception):
     """The model call did not produce a decision. The message has no API key."""
+
+
+def normalize_base_url(base_url: str) -> str:
+    """Return a canonical Token Factory base URL, or raise ReasoningError.
+
+    Fail closed. The API key is a bearer token, so a URL that is not HTTPS,
+    that carries user info, or whose host is not on the allowlist is refused
+    before any socket is opened. The refusal text does not repeat the URL.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ReasoningError("NEBIUS_BASE_URL is empty; the API key was not sent")
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme != "https":
+        raise ReasoningError("NEBIUS_BASE_URL must use HTTPS; the API key was not sent")
+    if parsed.username or parsed.password:
+        raise ReasoningError(
+            "NEBIUS_BASE_URL must not include credentials; the API key was not sent"
+        )
+    if parsed.port not in (None, 443):
+        raise ReasoningError("NEBIUS_BASE_URL must use port 443; the API key was not sent")
+    if parsed.query or parsed.fragment:
+        raise ReasoningError(
+            "NEBIUS_BASE_URL must not include a query or fragment; the API key was not sent"
+        )
+    path = (parsed.path or "").rstrip("/")
+    if path not in ("", "/v1"):
+        raise ReasoningError("NEBIUS_BASE_URL path must be /v1; the API key was not sent")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in ALLOWED_HOSTS:
+        raise ReasoningError(
+            "NEBIUS_BASE_URL is not a Nebius Token Factory host; the API key was not sent"
+        )
+    return f"https://{host}/v1"
 
 
 def build_messages(situation: nudge.Situation) -> list[dict[str, str]]:
@@ -194,9 +229,15 @@ class NebiusReasoner:
     ) -> None:
         self.api_key = api_key.strip()
         self.model = model.strip() or DEFAULT_MODEL
-        self.base_url = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
         self.timeout_sec = timeout_sec
         self._opener = opener or urllib.request.urlopen
+        # An untrusted URL is stored as an error, not as a host we might call.
+        try:
+            self.base_url = normalize_base_url(base_url or DEFAULT_BASE_URL)
+            self.url_error = ""
+        except ReasoningError as error:
+            self.base_url = ""
+            self.url_error = str(error)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None, opener=None) -> NebiusReasoner:
@@ -216,11 +257,21 @@ class NebiusReasoner:
 
     @property
     def endpoint(self) -> str:
-        """Chat completions URL. The key is not part of the URL."""
+        """Chat completions URL. The key is not part of the URL.
+
+        Empty when the base URL was refused, so there is no host to call.
+        """
+        if self.url_error:
+            return ""
         return self.base_url + "/chat/completions"
 
     def describe(self) -> str:
-        """One startup line. Does not include the API key."""
+        """One startup line. Does not include the API key or a refused URL."""
+        if self.url_error:
+            return (
+                "Nemotron: off. NEBIUS_BASE_URL is not a trusted Nebius HTTPS host, "
+                "so the API key is not sent."
+            )
         if not self.api_key:
             return (
                 "Nemotron: off. NEBIUS_API_KEY is not set, "
@@ -233,6 +284,10 @@ class NebiusReasoner:
         if not self.api_key:
             return nudge.ReasoningResult(
                 fallback="NEBIUS_API_KEY is not set; using the reminder rules"
+            )
+        if self.url_error:
+            return nudge.ReasoningResult(
+                fallback=f"Nebius call failed ({self.url_error}); using the reminder rules"
             )
         print(
             f"Asking {self.model} about {int(situation.away_seconds)}s unattended, "
@@ -298,6 +353,12 @@ class NebiusReasoner:
         return body
 
     def _post(self, body: dict) -> dict:
+        # Checked again here so a later change to the URL cannot skip advise.
+        if self.url_error or not self.endpoint:
+            raise ReasoningError(
+                self.url_error
+                or "NEBIUS_BASE_URL is not a Nebius Token Factory host; the API key was not sent"
+            )
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(body).encode("utf-8"),
@@ -365,7 +426,6 @@ def _one_line(value: object, *, limit: int) -> str:
 
 
 def _reject_forbidden(text: str) -> None:
-    lowered = text.lower()
-    for phrase in _FORBIDDEN:
-        if phrase in lowered:
-            raise ReasoningError("model wording was not allowed")
+    problem = nudge.spoken_wording_problem(text)
+    if problem:
+        raise ReasoningError(problem)

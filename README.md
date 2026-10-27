@@ -66,7 +66,7 @@ When a reminder is already due, Nudge can ask NVIDIA Nemotron 3 Super, through N
 - `remind` or `escalate`
 - a short caregiver summary when it escalates
 
-The room still hears one reminder before any caregiver ask. `--no-escalate` cannot be overridden. After the reminder cap (default 4), the caregiver is asked even if the model wanted another reminder, and the model's summary is kept when it wrote one. A sentence that scolds, or that claims the caregiver has already been told, is discarded.
+The room still hears one reminder before any caregiver ask. `--no-escalate` cannot be overridden. After the reminder cap (default 4), the caregiver is asked even if the model wanted another reminder, and the model's summary is kept when it wrote one. A sentence that scolds, or that claims someone was already contacted, is discarded. That includes a claim that never says "caregiver". The same check runs again if an ask is turned back into a reminder, so the room does not hear it.
 
 If `NEBIUS_API_KEY` is unset, or the call times out or returns something unusable, the built-in ladder speaks and the reason is appended to `data/decisions.jsonl`. The camera loop is not raised into.
 
@@ -83,7 +83,7 @@ Optional:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `NEBIUS_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | NVIDIA Nemotron model id. This is the text-to-text Super model in the [Token Factory Nemotron quickstart](https://nebius.com/services/token-factory/nemotron) and the [cookbook](https://github.com/nebius/token-factory-cookbook/blob/main/models/nemotron/nemotron3-super-120B.md). The public catalog lists it in `us-central1`. |
-| `NEBIUS_BASE_URL` | `https://api.tokenfactory.us-central1.nebius.com/v1` | OpenAI-compatible base URL for that model. The client calls `{base}/chat/completions`. |
+| `NEBIUS_BASE_URL` | `https://api.tokenfactory.us-central1.nebius.com/v1` | OpenAI-compatible base URL for that model. The client calls `{base}/chat/completions`. The host must be HTTPS and on the Token Factory allowlist (`api.tokenfactory.nebius.com` and the regional `api.tokenfactory.<region>.nebius.com` hosts). An http URL, a lookalike host, or anything else is refused and the key is not sent. |
 
 The request sets `stream` to false, `reasoning_effort` to `low` so the reply stays short, and `response_format` to a JSON object. If the host rejects those extra fields, the client tries once more as a plain chat completion. The timeout is 20 seconds.
 

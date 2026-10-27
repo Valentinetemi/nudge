@@ -238,6 +238,55 @@ def test_bad_json_and_a_scolding_line_fall_back() -> None:
     assert "not allowed" in result.fallback
 
 
+def test_a_delivery_claim_that_omits_caregiver_is_rejected() -> None:
+    text = json.dumps(
+        {
+            "action": "remind",
+            "urgency": "firm",
+            "message": "I already called them about the stove.",
+            "caregiver_summary": "",
+        }
+    )
+    try:
+        reason.parse_decision(text, model=MODEL)
+    except reason.ReasoningError as error:
+        assert "not allowed" in str(error)
+        assert "contacted" in str(error)
+    else:
+        raise AssertionError("a delivery claim must be rejected")
+
+
+def test_scolding_outside_the_old_phrase_list_is_rejected() -> None:
+    text = json.dumps(
+        {
+            "action": "remind",
+            "urgency": "firm",
+            "message": "That was foolish. Look at the stove.",
+            "caregiver_summary": "",
+        }
+    )
+    try:
+        reason.parse_decision(text, model=MODEL)
+    except reason.ReasoningError as error:
+        assert "scolds" in str(error)
+    else:
+        raise AssertionError("an insult must be rejected")
+
+
+def test_the_canned_ask_is_still_allowed() -> None:
+    text = json.dumps(
+        {
+            "action": "escalate",
+            "urgency": "firm",
+            "message": "I haven't seen you come back, so I'm letting your caregiver know.",
+            "caregiver_summary": "The stove has been unattended for 240 seconds after 2 reminders.",
+        }
+    )
+    advice = reason.parse_decision(text, model=MODEL)
+    assert advice.action == "escalate"
+    assert "caregiver" in advice.message
+
+
 def test_a_claim_that_the_caregiver_was_already_told_is_rejected() -> None:
     text = json.dumps(
         {
@@ -253,6 +302,58 @@ def test_a_claim_that_the_caregiver_was_already_told_is_rejected() -> None:
         assert "not allowed" in str(error)
     else:
         raise AssertionError("a claim of delivery must be rejected")
+
+
+def test_an_untrusted_base_url_does_not_receive_the_key() -> None:
+    refused = [
+        "http://api.tokenfactory.us-central1.nebius.com/v1",
+        "https://evil.example/v1",
+        "https://api.tokenfactory.us-central1.nebius.com.evil.example/v1",
+        "https://user:secret@api.tokenfactory.us-central1.nebius.com/v1",
+        "https://api.tokenfactory.us-central1.nebius.com/v1?token=1",
+        "https://127.0.0.1/v1",
+        "https://api.tokenfactory.us-central1.nebius.com:8443/v1",
+        "https://api.tokenfactory.nebius.com/v1/chat/completions",
+    ]
+
+    def opener(request, timeout=0):
+        raise AssertionError("the key must not be sent")
+
+    for base in refused:
+        client = reason.NebiusReasoner(api_key=KEY, base_url=base, opener=opener)
+        result = client.advise(situation())
+        assert result.advice is None
+        assert result.fallback is not None
+        assert "API key" in result.fallback
+        assert KEY not in result.fallback
+        assert "evil.example" not in result.fallback
+        assert "secret" not in result.fallback
+        assert client.endpoint == ""
+        assert "evil.example" not in client.describe()
+        try:
+            client._post({"model": MODEL})
+        except reason.ReasoningError as error:
+            assert KEY not in str(error)
+            assert "evil.example" not in str(error)
+        else:
+            raise AssertionError("post must fail closed before opening a connection")
+
+
+def test_a_documented_token_factory_host_is_allowed() -> None:
+    seen = []
+
+    def opener(request, timeout=0):
+        seen.append(request.full_url)
+        return _Response(completion(ESCALATE))
+
+    client = reason.NebiusReasoner(
+        api_key=KEY,
+        base_url="https://api.tokenfactory.nebius.com/v1/",
+        opener=opener,
+    )
+    result = client.advise(situation())
+    assert result.advice is not None
+    assert seen == ["https://api.tokenfactory.nebius.com/v1/chat/completions"]
 
 
 def test_the_prompt_names_the_event_and_not_a_picture() -> None:

@@ -310,6 +310,59 @@ class NudgeRuleTest(unittest.TestCase):
         self.assertEqual(step.source, "rule")
         self.assertIn("timed out", step.fallback or "")
 
+    def test_the_canned_sentences_are_safe_to_say(self) -> None:
+        for sentence in (*nudge.MESSAGES, nudge.ESCALATION_MESSAGE):
+            self.assertIsNone(nudge.spoken_wording_problem(sentence))
+
+    def test_a_delivery_claim_without_caregiver_is_not_spoken(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=4)
+        checker.update(True, False, 0)
+        step = checker.update(
+            True,
+            False,
+            10,
+            advisor=_escalate_with(
+                "I already called them about the stove.",
+                "The stove has been unattended for 240 seconds after 2 reminders.",
+            ),
+        )
+        assert step.nudge is not None
+        self.assertIsNone(step.escalate)
+        self.assertEqual(step.nudge.message, nudge.MESSAGES[0])
+        self.assertNotIn("called", step.nudge.message)
+        self.assertIn("not spoken", step.note or "")
+
+    def test_scolding_outside_a_short_word_list_is_not_spoken(self) -> None:
+        checker = rule(wait=10, repeat=5)
+        checker.update(True, False, 0)
+        step = checker.update(
+            True,
+            False,
+            10,
+            advisor=_remind("That was foolish. Look at the stove right now."),
+        )
+        assert step.nudge is not None
+        self.assertEqual(step.nudge.message, nudge.MESSAGES[0])
+        self.assertNotIn("foolish", step.nudge.message)
+
+    def test_a_bad_summary_is_replaced_when_the_model_escalates(self) -> None:
+        checker = nudge.NudgeRule(wait_seconds=10, repeat_seconds=5, max_reminders=4)
+        checker.update(True, False, 0)
+        checker.update(True, False, 10, advisor=_remind("Please glance at the stove."))
+        step = checker.update(
+            True,
+            False,
+            15,
+            advisor=_escalate_with(
+                nudge.ESCALATION_MESSAGE,
+                "They were already emailed about the stove after 2 reminders.",
+            ),
+        )
+        assert step.escalate is not None
+        self.assertEqual(step.escalate.message, nudge.ESCALATION_MESSAGE)
+        self.assertNotIn("emailed", step.escalate.caregiver_summary)
+        self.assertIn("unattended", step.escalate.caregiver_summary)
+
     def test_an_advisor_that_raises_falls_back(self) -> None:
         checker = rule(wait=10, repeat=5)
 
@@ -339,21 +392,26 @@ def _remind(message: str):
     return advisor
 
 
-def _escalate():
+def _escalate_with(message: str, summary: str):
     def advisor(facts: nudge.Situation) -> nudge.ReasoningResult:
         return nudge.ReasoningResult(
             advice=nudge.Advice(
                 action="escalate",
                 urgency="firm",
-                message="I haven't seen you come back, so I'm letting your caregiver know.",
-                caregiver_summary=(
-                    "The stove has been unattended for 240 seconds after 2 reminders."
-                ),
+                message=message,
+                caregiver_summary=summary,
                 model="nvidia/nemotron-3-super-120b-a12b",
             )
         )
 
     return advisor
+
+
+def _escalate():
+    return _escalate_with(
+        "I haven't seen you come back, so I'm letting your caregiver know.",
+        "The stove has been unattended for 240 seconds after 2 reminders.",
+    )
 
 
 if __name__ == "__main__":
