@@ -1,5 +1,6 @@
 """Cloud tests stay on this machine. They check that pictures cannot be sent."""
 
+import io
 import json
 import sys
 import threading
@@ -142,6 +143,82 @@ def test_aws_refuses_the_localhost_demo_key(tmp_path: Path) -> None:
     )
     assert client.send(_event()) is False
     assert client.queued_events() == []
+
+
+class _QuietResponse:
+    def read(self) -> bytes:
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+
+def test_a_rejected_new_field_is_sent_again_without_it(monkeypatch) -> None:
+    bodies: list[dict] = []
+
+    def fake_open(request, timeout=0):
+        body = json.loads(request.data.decode())
+        bodies.append(body)
+        if "urgency" in body or "caregiver_summary" in body:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "bad",
+                None,
+                io.BytesIO(b"unknown field"),
+            )
+        return _QuietResponse()
+
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", fake_open)
+    event = _event(
+        name="escalate",
+        reason="I haven't seen you come back, so I'm letting your caregiver know.",
+        urgency="firm",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        source="nemotron",
+        caregiver_summary="Unattended for 240 seconds after 2 reminders.",
+    )
+    assert cloud.urlopen_post("https://example.amazonaws.com", "secret", event, 1.5) == "ok"
+    assert len(bodies) == 2
+    assert "urgency" not in bodies[1]
+    assert "model" not in bodies[1]
+    assert "source" not in bodies[1]
+    assert "caregiver_summary" not in bodies[1]
+    assert "240" in bodies[1]["reason"]
+    assert "secret" not in json.dumps(bodies[1])
+    assert bodies[1]["event"] == "escalate"
+
+
+def test_an_auth_failure_is_not_resent_without_fields(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_open(request, timeout=0):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "no", None, io.BytesIO(b"no")
+        )
+
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", fake_open)
+    event = _event(urgency="firm", caregiver_summary="Unattended for 240 seconds.")
+    assert cloud.urlopen_post("https://example.amazonaws.com", "secret", event, 1.5) == "drop"
+    assert calls["n"] == 1
+
+
+def test_a_legacy_rejection_is_not_retried(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_open(request, timeout=0):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(
+            request.full_url, 400, "bad", None, io.BytesIO(b"no")
+        )
+
+    monkeypatch.setattr(cloud.urllib.request, "urlopen", fake_open)
+    assert cloud.urlopen_post("https://example.amazonaws.com", "secret", _event(), 1.5) == "drop"
+    assert calls["n"] == 1
 
 
 def test_request_keeps_the_key_out_of_the_body() -> None:

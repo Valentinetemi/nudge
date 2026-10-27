@@ -45,6 +45,8 @@ TEXT_FIELDS = {
     "prompt",
     "phase",
     "trace",
+    # Optional Nemotron fields. An older deployment does not know them;
+    # the laptop sends the event again without them if they are rejected.
     "caregiver_summary",
     "urgency",
     "model",

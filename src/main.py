@@ -645,6 +645,8 @@ def main() -> None:
                         "reminders_unanswered": step.nudge.level,
                         "stove_occupied": stove_occupied.value,
                         "hands_present": hands_nearby.value,
+                        # Newer fields. An older API that rejects them gets
+                        # a second post without them, so the event is kept.
                         "urgency": step.nudge.urgency,
                         **model_event_fields(step),
                     },
