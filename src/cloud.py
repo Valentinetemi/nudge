@@ -47,6 +47,13 @@ TEXT_FIELDS = {
     "prompt",
     "phase",
     "trace",
+    # Written by the Nemotron step. Still text. Still no picture.
+    "caregiver_summary",
+    "urgency",
+    "model",
+    "source",
+    "fallback",
+    "note",
 }
 NUMBER_FIELDS = {"away_seconds", "reminders_unanswered"}
 BOOL_FIELDS = {"stove_occupied", "hands_present"}
@@ -69,6 +76,19 @@ MAX_STRING = 2000
 MAX_BYTES = 4096
 DEFAULT_COOLDOWN_SEC = 15.0
 DEFAULT_TIMEOUT_SEC = 1.5
+
+# Fields added for the Nemotron step. A Lambda deployed before this list
+# rejects them with 400, and a plain 4xx used to drop the whole event.
+EXTENDED_EVENT_FIELDS = frozenset(
+    {
+        "caregiver_summary",
+        "urgency",
+        "model",
+        "source",
+        "fallback",
+        "note",
+    }
+)
 
 
 class EventRejected(ValueError):
@@ -213,36 +233,95 @@ def build_request(url: str, api_key: str, event: dict[str, object]) -> urllib.re
     )
 
 
+def compatible_event(event: dict[str, object]) -> dict[str, object]:
+    """The same event with only fields an older Lambda accepts.
+
+    The caregiver summary is folded into `reason`, which that schema already
+    stores, so the words survive the fields that schema rejects.
+    """
+    legacy = {
+        key: value
+        for key, value in event.items()
+        if key not in EXTENDED_EVENT_FIELDS
+    }
+    summary = event.get("caregiver_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return legacy
+    summary = " ".join(summary.split())
+    reason = legacy.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        combined = summary
+    elif summary in reason:
+        return legacy
+    else:
+        combined = f"{reason.rstrip()} {summary}"
+    if len(combined) <= MAX_STRING:
+        legacy["reason"] = combined
+    return legacy
+
+
+def _post_once(
+    url: str,
+    api_key: str,
+    event: dict[str, object],
+    timeout: float,
+) -> tuple[str, int | None, str]:
+    """One POST. Return ok/drop/retry, the HTTP status, and a log phrase."""
+    request = build_request(url, api_key, event)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+        return "ok", getattr(response, "status", 200), ""
+    except urllib.error.HTTPError as error:
+        error.read()
+        # 408/429 and server errors are temporary. Other 4xx responses mean
+        # this payload will not start working if we keep sending it.
+        if error.code in (408, 429) or 500 <= error.code <= 599:
+            return "retry", error.code, ""
+        return "drop", error.code, ""
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return "retry", None, str(error)
+
+
 def urlopen_post(
     url: str,
     api_key: str,
     event: dict[str, object],
     timeout: float,
 ) -> str:
-    """Send one event. Return 'ok', 'drop' (do not retry), or 'retry'."""
-    request = build_request(url, api_key, event)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
-        return "ok"
-    except urllib.error.HTTPError as error:
-        error.read()
-        # 408/429 and server errors are temporary. Other 4xx responses mean
-        # this payload will not start working if we keep sending it.
-        if error.code in (408, 429) or 500 <= error.code <= 599:
+    """Send one event. Return 'ok', 'drop' (do not retry), or 'retry'.
+
+    A 400 or 422 on a payload that carries the newer Nemotron fields is
+    sent again without those fields. An older Lambda then keeps the event
+    instead of the client dropping it. Auth failures are not retried.
+    """
+    result, code, detail = _post_once(url, api_key, event, timeout)
+    extended = any(field in event for field in EXTENDED_EVENT_FIELDS)
+    if result == "drop" and code in (400, 422) and extended:
+        print(
+            "Caregiver API rejected the newer event fields. "
+            "Sending the same event without them."
+        )
+        result, code, detail = _post_once(
+            url, api_key, compatible_event(event), timeout
+        )
+    if result == "retry":
+        if code is None:
             print(
-                f"Caregiver API returned HTTP {error.code}. "
+                f"Caregiver API unreachable ({detail}). "
                 "The event stays in the local outbox."
             )
-            return "retry"
+        else:
+            print(
+                f"Caregiver API returned HTTP {code}. "
+                "The event stays in the local outbox."
+            )
+    elif result == "drop":
         print(
-            f"Caregiver API rejected an event with HTTP {error.code}. "
+            f"Caregiver API rejected an event with HTTP {code}. "
             "It was not queued."
         )
-        return "drop"
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"Caregiver API unreachable ({error}). The event stays in the local outbox.")
-        return "retry"
+    return result
 
 
 class CloudClient:

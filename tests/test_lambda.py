@@ -30,6 +30,15 @@ CASES = [
     {"event": "remind", "observed": "data:image/png;base64,aaaa"},
     {"event": "remind", "away_seconds": True, "observed": "hi", "time": "t"},
     {"event": "remind", "observed": "hi", "mystery": 1, "time": "t"},
+    {
+        "time": "2026-10-27T12:00:00",
+        "event": "escalate",
+        "observed": "I haven't seen you come back, so I'm letting your caregiver know.",
+        "caregiver_summary": "Unattended for 240 seconds after 2 reminders.",
+        "urgency": "firm",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "source": "nemotron",
+    },
     ["not", "a", "dict"],
     {"observed": "missing the event name", "time": "t"},
 ]
@@ -48,6 +57,34 @@ def _outcome(function, payload):
 def test_lambda_validation_matches_the_laptop() -> None:
     for payload in CASES:
         assert _outcome(app.validate_event, payload) == _outcome(cloud.sanitize_event, payload)
+
+
+def test_model_fields_are_accepted_and_preserved() -> None:
+    """Both validators must keep the Nemotron fields, not merely agree.
+
+    A parity check alone still passes when both sides reject the event.
+    """
+    payload = {
+        "time": "2026-10-27T12:00:00",
+        "event": "escalate",
+        "observed": "I haven't seen you come back, so I'm letting your caregiver know.",
+        "caregiver_summary": "Unattended for 240 seconds after 2 reminders.",
+        "urgency": "firm",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+        "source": "nemotron",
+        "fallback": "not used",
+        "note": "The reminder cap is reached, so this asks the caregiver.",
+    }
+    for validate in (cloud.sanitize_event, app.validate_event):
+        clean = validate(payload)
+        assert clean["event"] == "escalate"
+        assert clean["observed"] == payload["observed"]
+        assert clean["caregiver_summary"] == payload["caregiver_summary"]
+        assert clean["urgency"] == "firm"
+        assert clean["model"] == payload["model"]
+        assert clean["source"] == "nemotron"
+        assert clean["fallback"] == "not used"
+        assert clean["note"] == payload["note"]
 
 
 def test_privacy_sentence_matches_the_laptop() -> None:
@@ -93,6 +130,17 @@ def test_escalation_message_has_no_video() -> None:
     assert "Please check the stove." in message
     assert "No video was included." in message
     assert cloud.PRIVACY_SENTENCE in message
+    summary = app.escalation_message(
+        {
+            "device": "kitchen",
+            "observed": "Please check the stove.",
+            "reminders_unanswered": 2,
+            "away_seconds": 180,
+            "caregiver_summary": "Unattended for 180 seconds after 2 reminders.",
+        }
+    )
+    assert "Unattended for 180 seconds after 2 reminders." in summary
+    assert "frame" not in summary
 
 
 def _request(method: str, path: str, body: dict | None = None, key: str | None = None):

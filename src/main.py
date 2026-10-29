@@ -25,6 +25,7 @@ from pathlib import Path
 
 import cloud
 import nudge
+import reason
 
 # Resolve files from the repository root instead of the terminal's current
 # directory. This lets the program work when launched from somewhere else.
@@ -238,12 +239,74 @@ def log_event(
         active_cloud.send(payload)
 
 
-def log_decision(when: str, trace: str) -> None:
-    """Append one readable decision. `trace` is already a sentence of facts."""
+def log_decision(when: str, trace: str, **fields: object) -> None:
+    """Append one readable decision. `trace` is already a sentence of facts.
+
+    Extra fields are for a model decision or a fallback. Empty values are
+    left out so a plain wait line stays a time and a trace. The API key is
+    not a field this function accepts.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"time": when, "trace": trace}
+    record: dict[str, object] = {"time": when, "trace": trace}
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        record[key] = value
     with DECISIONS_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
+
+
+def model_event_fields(step: nudge.Step) -> dict[str, str]:
+    """Text fields a caregiver event may carry about who chose the step.
+
+    Empty values are omitted. The API key is not one of these fields.
+    """
+    fields: dict[str, str] = {}
+    if step.model:
+        fields["model"] = step.model
+    if step.fallback:
+        fields["source"] = "rule"
+        fields["fallback"] = step.fallback
+    elif step.source == "nemotron":
+        fields["source"] = "nemotron"
+    if step.note:
+        fields["note"] = step.note
+    if step.escalate is not None and step.escalate.caregiver_summary:
+        fields["caregiver_summary"] = step.escalate.caregiver_summary
+    return fields
+
+
+def decision_log_fields(step: nudge.Step) -> dict[str, str]:
+    """Fields to store beside the trace when a model was involved.
+
+    A plain rule step with no fallback adds nothing, so older log lines
+    keep their shape. A Nemotron choice records the action, the urgency,
+    the spoken line, and the caregiver summary. A fallback records why
+    the rules spoke instead.
+    """
+    fields: dict[str, str] = {}
+    if step.fallback:
+        fields["source"] = "rule"
+        fields["fallback"] = step.fallback
+        return fields
+    if step.source != "nemotron":
+        return fields
+    fields["source"] = "nemotron"
+    if step.model:
+        fields["model"] = step.model
+    if step.note:
+        fields["note"] = step.note
+    if step.nudge is not None:
+        fields["action"] = "remind"
+        fields["urgency"] = step.nudge.urgency
+        fields["message"] = step.nudge.message
+    elif step.escalate is not None:
+        fields["action"] = "escalate"
+        fields["urgency"] = step.escalate.urgency
+        fields["message"] = step.escalate.message
+        if step.escalate.caregiver_summary:
+            fields["caregiver_summary"] = step.escalate.caregiver_summary
+    return fields
 
 
 def count_hands_in_zone(
@@ -417,6 +480,10 @@ def main() -> None:
         queue_path=DATA_DIR / "outbox.jsonl",
     )
     print(active_cloud.describe())
+    # .env is already loaded by the cloud client. A missing key leaves the
+    # reminder ladder in charge and does not open a connection.
+    nemotron = reason.NebiusReasoner.from_env()
+    print(nemotron.describe())
 
     if max_reminders is None:
         follow_up = "and keeps repeating the last reminder"
@@ -549,6 +616,7 @@ def main() -> None:
                 stove_occupied=stove_occupied.value,
                 hands_nearby=hands_nearby.value,
                 now=now,
+                advisor=nemotron.advise,
             )
             trace = reminders.describe(
                 now,
@@ -556,6 +624,13 @@ def main() -> None:
                 hands_nearby=hands_nearby.value,
             )
             away = reminders.unattended_for(now)
+            if step.fallback:
+                print(f"Nemotron fallback: {step.fallback}")
+            elif step.source == "nemotron":
+                chosen = "escalate" if step.escalate is not None else "remind"
+                print(f"Nemotron ({step.model}) chose {chosen}.")
+                if step.note:
+                    print(step.note)
             if step.nudge is not None:
                 log_event(
                     "nudge",
@@ -570,6 +645,10 @@ def main() -> None:
                         "reminders_unanswered": step.nudge.level,
                         "stove_occupied": stove_occupied.value,
                         "hands_present": hands_nearby.value,
+                        # Newer fields. An older API that rejects them gets
+                        # a second post without them, so the event is kept.
+                        "urgency": step.nudge.urgency,
+                        **model_event_fields(step),
                     },
                 )
                 speaker.say(step.nudge.message)
@@ -587,8 +666,12 @@ def main() -> None:
                         "reminders_unanswered": step.escalate.reminders_unanswered,
                         "stove_occupied": stove_occupied.value,
                         "hands_present": hands_nearby.value,
+                        "urgency": step.escalate.urgency,
+                        **model_event_fields(step),
                     },
                 )
+                if step.escalate.caregiver_summary:
+                    print(f"Caregiver summary: {step.escalate.caregiver_summary}")
                 speaker.say(step.escalate.message)
             elif step.ended is not None:
                 ended_text = nudge.ended_message(step.ended)
@@ -617,7 +700,10 @@ def main() -> None:
             )
             if acted or now - last_decision_log >= 1.0:
                 when = datetime.now().isoformat(timespec="seconds")
-                log_decision(when, f"{when[11:]}  {trace}")
+                # Model fields ride on the line for the moment that spoke
+                # or asked. A once-a-second wait stays a trace only.
+                extra = decision_log_fields(step) if acted else {}
+                log_decision(when, f"{when[11:]}  {trace}", **extra)
                 last_decision_log = now
             # A dead API must not be contacted on every frame. The client
             # also waits out its own cooldown after a failure.

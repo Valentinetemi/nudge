@@ -14,7 +14,7 @@ select = ["E", "F", "I", "W"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "cloud", "evaluate_stove", "main", "mock_cloud", "nudge", "record_clip", "speak", "stove"]
+known-first-party = ["app", "cloud", "demo_nemotron", "evaluate_stove", "main", "mock_cloud", "nudge", "reason", "record_clip", "speak", "stove"]
 
 [tool.ruff.lint.per-file-ignores]
 # These modules insert a local path before importing the project.
@@ -24,3 +24,4 @@ known-first-party = ["app", "cloud", "evaluate_stove", "main", "mock_cloud", "nu
 "scripts/mock_cloud.py" = ["E402"]
 "scripts/evaluate_stove.py" = ["E402"]
 "scripts/record_clip.py" = ["E402"]
+"scripts/demo_nemotron.py" = ["E402"]

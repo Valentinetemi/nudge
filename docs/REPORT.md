@@ -88,6 +88,8 @@ The clock starts on the first sample where the stove is occupied and hands are a
 
 `describe()` writes one line of those facts. `src/main.py` appends it to `data/decisions.jsonl` about once a second and again when it speaks, asks, or stops. The activity log stays in `data/events.jsonl`.
 
+When `NEBIUS_API_KEY` is set, the camera asks `src/reason.py` at a due moment and not during the waits. That module posts the same facts (no frame) to Nebius Token Factory and NVIDIA Nemotron 3 Super (`nvidia/nemotron-3-super-120b-a12b` on `https://api.tokenfactory.us-central1.nebius.com/v1`). The model may replace the canned sentence, the urgency, and the choice between another reminder and the caregiver ask, and it writes the caregiver summary. The caps in this section still apply. A missing key, a timeout, or a bad reply leaves the ladder above in place, and that reason is stored on the decision line. The clip scorer does not set a key, so the evaluation path is unchanged.
+
 Speech is `src/speak.py`. It tries a local voice (`say` on macOS, `espeak-ng` or `espeak` on Linux, the Windows speech synthesizer), then a short two-note chime, then the console. `say()` returns immediately. The rule does not know whether a caregiver message was delivered. The sentence asks. Delivery is the network and the confirmed subscription. With cloud mode off, delivery does not happen at all. The sentence is still spoken.
 
 ## AWS deployment

@@ -10,7 +10,7 @@ Seeing and deciding happen on the laptop:
 
 1. **Hands.** MediaPipe's hand landmarker looks for hands in a zone you draw (the counter, by default). A hand counts only after it has been seen for about a second, so a flicker does not spam the log. Hands over the stove count too, so stirring a pot counts as "someone is here" even if the hand zone is the counter beside it.
 2. **Stove.** You draw a box around the stove and photograph it while it is empty (`B`). Each new frame is compared with that picture. The percentage of pixels that changed is shown on screen. Above 5%, the stove counts as occupied, again only after the change holds for about a second. Broad lighting is cancelled before that comparison, and while the stove stays clear the empty picture drifts slowly so daylight does not pile up into a false "something was placed" event. That drift stays in memory. It is not written back over the photo you saved with `B`.
-3. **Nudge.** If the stove stays occupied and no hands have been nearby, a clock starts. The default wait is **3 minutes** (`--nudge-after 180`). The first reminder is "Something is still on the stove." If nobody comes back, Nudge speaks again after **1 minute** (`--nudge-repeat 60`), then in slightly more direct words, and then stops getting sterner. Coming back or clearing the stove resets the clock. The next absence waits the full 3 minutes again.
+3. **Nudge.** If the stove stays occupied and no hands have been nearby, a clock starts. The default wait is **3 minutes** (`--nudge-after 180`). The first reminder is "Something is still on the stove." If nobody comes back, Nudge speaks again after **1 minute** (`--nudge-repeat 60`), then in slightly more direct words, and then stops getting sterner. Coming back or clearing the stove resets the clock. The next absence waits the full 3 minutes again. When a reminder is due and `NEBIUS_API_KEY` is set, NVIDIA Nemotron chooses the spoken wording, the urgency, whether to ask the caregiver, and the caregiver summary. See [Nebius x NVIDIA](#nebius-x-nvidia). If the key is missing or the call fails, the sentences above are what is spoken.
 4. **Caregiver.** After four spoken reminders (the default), the next quiet minute produces one request: "I haven't seen you come back, so I'm letting your caregiver know." That sentence is spoken in the room and written to the log. It does not claim the message has already been delivered. `--no-escalate` keeps repeating the last reminder instead. A new absence, after the person comes back or the stove is cleared, can ask again.
 
 The decision is a function of what the camera has confirmed: stove occupied or clear, hands nearby or away, how long the stove has been unattended, and how many reminders are still unanswered. Each check is one line in `data/decisions.jsonl`.
@@ -28,6 +28,7 @@ flowchart LR
   cv[OpenCV 5 stove comparison]
   mp[MediaPipe hands]
   rule[Nudge rule]
+  nemo[Nemotron on Nebius]
   voice[Voice, then tone, then console]
   outbox[Local outbox]
   api[API Gateway]
@@ -41,7 +42,9 @@ flowchart LR
   cam --> mp
   cv --> rule
   mp --> rule
-  rule --> voice
+  rule -->|when a reminder is due| nemo
+  nemo -->|wording, urgency, ask, summary| voice
+  rule -->|no key, timeout, or error| voice
   rule -->|text events only| outbox
   outbox --> api
   api --> fn
@@ -52,11 +55,62 @@ flowchart LR
   page --> person
 ```
 
-The cloud boxes are optional. `NUDGE_CLOUD` defaults to `off`, and then the diagram stops at the laptop. When it is `mock` or `aws`, only the text event is sent. Frames never leave the device; only text events go to AWS, with caregiver consent.
+The cloud boxes are optional. `NUDGE_CLOUD` defaults to `off`, and then the diagram stops at the laptop except for the Nemotron call, which also stays off until `NEBIUS_API_KEY` is set. When cloud mode is `mock` or `aws`, only the text event is sent. Frames never leave the device; only text events go to AWS, with caregiver consent. The Nemotron request is the same kind of text: seconds unattended, reminders already spoken, and the last sentence. It does not include a frame.
+
+## Nebius x NVIDIA
+
+When a reminder is already due, Nudge can ask NVIDIA Nemotron 3 Super, through Nebius Token Factory, what to say and whether this is the moment to ask the caregiver. The clock does not move to the model. The model is called once per due moment, not on every camera frame. It returns:
+
+- the sentence to speak in the room
+- an urgency of calm, direct, or firm
+- `remind` or `escalate`
+- a short caregiver summary when it escalates
+
+The room still hears one reminder before any caregiver ask. `--no-escalate` cannot be overridden. After the reminder cap (default 4), the caregiver is asked even if the model wanted another reminder, and the model's summary is kept when it wrote one. A sentence that scolds, or that claims someone was already contacted, is discarded. That includes a claim that never says "caregiver". The same check runs again if an ask is turned back into a reminder, so the room does not hear it.
+
+If `NEBIUS_API_KEY` is unset, or the call times out or returns something unusable, the built-in ladder speaks and the reason is appended to `data/decisions.jsonl`. The camera loop is not raised into.
+
+### Key, model, and URL
+
+Create an API key in [Nebius Token Factory](https://tokenfactory.nebius.com) (API keys). Put it in `.env`, which is gitignored. Copy from `.env.example`. Real environment variables win over the file. Do not commit the key.
+
+```bash
+NEBIUS_API_KEY=your-token-factory-key
+```
+
+Optional:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NEBIUS_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | NVIDIA Nemotron model id. This is the text-to-text Super model in the [Token Factory Nemotron quickstart](https://nebius.com/services/token-factory/nemotron) and the [cookbook](https://github.com/nebius/token-factory-cookbook/blob/main/models/nemotron/nemotron3-super-120B.md). The public catalog lists it in `us-central1`. |
+| `NEBIUS_BASE_URL` | `https://api.tokenfactory.us-central1.nebius.com/v1` | OpenAI-compatible base URL for that model. The client calls `{base}/chat/completions`. The host must be HTTPS and on the Token Factory allowlist (`api.tokenfactory.nebius.com` and the regional `api.tokenfactory.<region>.nebius.com` hosts). An http URL, a lookalike host, or anything else is refused and the key is not sent. |
+
+The request sets `stream` to false, `reasoning_effort` to `low` so the reply stays short, and `response_format` to a JSON object. If the host rejects those extra fields, the client tries once more as a plain chat completion. The timeout is 20 seconds.
+
+One sample event, with no camera, for a demo recording:
+
+```bash
+export NEBIUS_API_KEY=your-token-factory-key
+python scripts/demo_nemotron.py
+```
+
+That sample is a stove left occupied, hands away, for 240 seconds, after two reminders. The script prints the decision, or the fallback, and exits 1 when it had to fall back. `--away` and `--reminders` change the sample. Nothing in the request is a picture, and the key is not printed.
+
+### What's new since Aug 26
+
+26 August 2026 is before anything in this repository. The first commit is 19 October 2026. Since that cutoff the project gained, in order:
+
+- hand detection in a zone you draw, with a one-second debounce and a plain-language event log
+- stove occupancy by comparing the live stove to an empty photo, including lighting normalization so a lamp is not a pot
+- the reminder clock, offline speech (voice, then a chime, then the console), and the on-screen banner
+- one caregiver ask after the spoken reminders, a decision log, and an optional text-only path to a local dashboard or to AWS (API Gateway, Lambda, DynamoDB, SNS)
+- this branch: a live Nemotron decision on Nebius Token Factory at each due moment, with the rule ladder kept as the fallback
+
+Hardware is not required for the Nemotron step. `scripts/demo_nemotron.py` is enough to show the live call.
 
 ## Privacy
 
-With the default settings, everything stays on the machine. The camera frames are not uploaded, and there is no account and no cloud model. The only network request in the program is an optional download of the hand model, and only when `models/hand_landmarker.task` is missing. That file is already in the repository so a demo can run offline.
+With the default settings, everything stays on the machine. The camera frames are not uploaded. There is no account. Nemotron is not called unless `NEBIUS_API_KEY` is set. The only network request without that key, and without cloud mode, is an optional download of the hand model, and only when `models/hand_landmarker.task` is missing. That file is already in the repository so a demo can run offline.
 
 If you turn cloud mode on, frames never leave the device; only text events go to AWS, with caregiver consent. A text event is a time, a short sentence, and a few numbers (how long the stove has been unattended, how many reminders went unanswered). The client rejects a field that looks like a picture. The API key travels in a header, not in the event.
 
@@ -142,7 +196,7 @@ Each line in `data/events.jsonl` is one JSON object with `time`, `event`, and `o
 
 `nudge` is a spoken reminder. `escalate` is the one caregiver ask. `nudge_ended` is written when a reminder stops, and the sentence says whether someone came back or the stove is clear.
 
-`data/decisions.jsonl` is the longer trace. About once a second, and again whenever a reminder, an ask, or a stop happens, it stores a line such as `REMIND     stove occupied, hands away, away for 180s, 1 reminder unanswered`. Waits are in that file. They are not printed on every frame.
+`data/decisions.jsonl` is the longer trace. About once a second, and again whenever a reminder, an ask, or a stop happens, it stores a line such as `REMIND     stove occupied, hands away, away for 180s, 1 reminder unanswered`. Waits are in that file. They are not printed on every frame. When Nemotron chose the step, that same line also stores `source`, `model`, `action`, `urgency`, `message`, and, for an ask, `caregiver_summary`. When the call was skipped or failed, the line stores `fallback` instead. The API key is never one of the fields.
 
 ## Caregiver events
 
@@ -294,7 +348,7 @@ ruff check src tests scripts aws
 
 `requirements-dev.txt` pins `pytest==8.4.2` and `ruff==0.14.2`.
 
-The tests cover the reminder clock and the one caregiver ask, the lighting comparison (drawn pictures, not a webcam), the slow empty-picture drift, the voice/tone/console fallback, the command-line defaults, the text-only client, the local dashboard, the Lambda handler with AWS replaced by fakes, and the shape of an evaluation report. They do not measure a kitchen.
+The tests cover the reminder clock and the one caregiver ask, a Nemotron decision with the HTTP call mocked (including a missing key, a timeout, and an HTTP error), the lighting comparison (drawn pictures, not a webcam), the slow empty-picture drift, the voice/tone/console fallback, the command-line defaults, the text-only client, the local dashboard, the Lambda handler with AWS replaced by fakes, and the shape of an evaluation report. They do not measure a kitchen, and they do not call Nebius.
 
 ## Evaluation
 
@@ -361,7 +415,7 @@ Leave this table as FILL IN until those clips exist. A blank table is the honest
 - Nudge is not a medical device, not a fire alarm, and not a substitute for someone watching a person who needs care. It can miss a boil-over, a fire, or a fall. It can also nudge when the stove is fine.
 - One escalation is requested per absence, not a stream of messages. Hands coming back, or the stove being cleared, closes that episode. With `NUDGE_CLOUD=off` the ask is spoken and logged on the laptop only.
 - Do not point this at someone who has not agreed to it. Do not use it as covert surveillance. The product stores text about a task, not a record of a person's face. The hand model looks for hands inside a zone you draw. It does not identify who the person is.
-- API keys live in `.env` on the laptop and in the Lambda configuration in AWS. Anyone who can read the function's environment can read those keys. Rotate them if they leak. `local-dev-key` must not be deployed.
+- API keys live in `.env` on the laptop and in the Lambda configuration in AWS. Anyone who can read the function's environment can read those keys. Rotate them if they leak. `local-dev-key` must not be deployed. `NEBIUS_API_KEY` is the same kind of secret. It is sent only as a bearer token to Token Factory, and only at a due moment. It is not written to the decision log or the event body.
 - DynamoDB items expire after 30 days. Delete the stack when the demo is over.
 - If the network is down, the spoken reminder still happens on the laptop. The caregiver message waits in `data/outbox.jsonl` and may arrive late or not at all.
 
@@ -375,6 +429,7 @@ Leave this table as FILL IN until those clips exist. A blank table is the honest
 - There is one stove zone. The reference photo is the one you last saved with `B`. The slow daylight drift is kept in memory and is not written back over that photo.
 - If the laptop has no working voice and no speaker, the reminder is only on screen and in the terminal.
 - The caregiver path is optional and fails soft. A dead network means the dashboard and the email can lag or never arrive. The sentence in the room still does not mean the caregiver has already been told.
+- Nemotron sees the same numbers the rule sees. It does not see the camera. The first due moment stays a reminder, and the reminder cap still asks the caregiver once. Without a key, or when Token Factory does not answer within 20 seconds, the built-in sentences are used.
 - The AWS stack in this repository has been validated and built locally. It has not been deployed from here.
 
 ## What you still do by hand
@@ -394,6 +449,8 @@ This branch was not deployed to AWS, and it was not filmed in a kitchen.
 | --- | --- |
 | `src/main.py` | Camera loop, zones, speech, decision log, optional send |
 | `src/nudge.py` | Reminder clock and the one caregiver ask. No camera. |
+| `src/reason.py` | Nemotron decision via Nebius Token Factory, with a rule fallback. |
+| `scripts/demo_nemotron.py` | One sample event, one live Nemotron call. No camera. |
 | `src/stove.py` | OpenCV occupancy, lighting normalization, empty-picture drift |
 | `src/speak.py` | Offline voice, then a chime, then the console |
 | `src/cloud.py` | Text-only client and offline outbox |

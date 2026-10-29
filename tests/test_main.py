@@ -73,6 +73,41 @@ class DecisionLogTest(unittest.TestCase):
         self.assertIn("stove occupied", record["trace"])
         self.assertNotIn("frame", line)
 
+    def test_a_model_decision_is_stored_without_a_key(self) -> None:
+        original_dir = main.DATA_DIR
+        original_file = main.DECISIONS_FILE
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                main.DATA_DIR = folder
+                main.DECISIONS_FILE = folder / "decisions.jsonl"
+                step = main.nudge.Step(
+                    nudge=main.nudge.Nudge(
+                        level=1,
+                        message="The pot is still on the stove.",
+                        urgency="calm",
+                    ),
+                    source="nemotron",
+                    model="nvidia/nemotron-3-super-120b-a12b",
+                )
+                main.log_decision(
+                    "2026-10-27T12:00:00",
+                    "12:00:00  REMIND     stove occupied, hands away, away for 180s, 1 reminder unanswered",
+                    **main.decision_log_fields(step),
+                )
+                line = main.DECISIONS_FILE.read_text(encoding="utf-8").strip()
+        finally:
+            main.DATA_DIR = original_dir
+            main.DECISIONS_FILE = original_file
+        record = json.loads(line)
+        self.assertEqual(record["source"], "nemotron")
+        self.assertEqual(record["model"], "nvidia/nemotron-3-super-120b-a12b")
+        self.assertEqual(record["action"], "remind")
+        self.assertEqual(record["urgency"], "calm")
+        self.assertEqual(record["message"], "The pot is still on the stove.")
+        self.assertNotIn("NEBIUS_API_KEY", line)
+        self.assertNotIn("frame", line)
+
 
 class CameraArgumentTest(unittest.TestCase):
     def test_cam_defaults_to_the_built_in_camera(self) -> None:
